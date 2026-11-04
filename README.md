@@ -45,7 +45,7 @@ Two ways, depending on where the extension comes from.
 store; a setup tab opens. Then install only the native host:
 
 ```sh
-git clone https://github.com/zen-extensions/phone-passkeys.git
+git clone https://github.com/Victorohrn/phone-passkeys.git
 cd phone-passkeys
 ./install.sh --host-only
 ```

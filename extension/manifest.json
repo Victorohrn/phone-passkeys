@@ -3,7 +3,7 @@
   "name": "Phone Passkeys",
   "version": "0.1.0",
   "description": "Use passkeys stored on your phone or tablet by scanning a QR code (WebAuthn hybrid transport) in Zen and Firefox on Linux.",
-  "homepage_url": "https://github.com/zen-extensions/phone-passkeys",
+  "homepage_url": "https://github.com/Victorohrn/phone-passkeys",
   "browser_specific_settings": {
     "gecko": {
       "id": "phone-passkeys@zen-extensions.local",

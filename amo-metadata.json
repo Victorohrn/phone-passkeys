@@ -14,7 +14,7 @@
     ]
   },
   "homepage": {
-    "en-US": "https://github.com/zen-extensions/phone-passkeys"
+    "en-US": "https://github.com/Victorohrn/phone-passkeys"
   },
   "is_experimental": false,
   "requires_payment": false,
