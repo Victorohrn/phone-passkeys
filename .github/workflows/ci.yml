@@ -22,6 +22,10 @@ jobs:
           workspaces: host
       - run: cargo build --release --manifest-path host/Cargo.toml
       - run: cargo test --release --manifest-path host/Cargo.toml
+      - name: Vendored libwebauthn tests
+        run: cargo test --release --lib --manifest-path host/vendor/libwebauthn/Cargo.toml
+        env:
+          CARGO_TARGET_DIR: host/target
       - run: cargo clippy --release --manifest-path host/Cargo.toml -- -D warnings
       - name: Package host
         run: |
