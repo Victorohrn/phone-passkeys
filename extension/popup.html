@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; font: 13.5px/1.45 system-ui, sans-serif; min-width: 300px; }
+    .popup { padding: 14px 16px; }
+    h1 { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
+    p { margin: 0 0 10px; }
+    .ok { color: #1e8e3e; }
+    .bad { color: #d93025; }
+    code { font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="popup">
+    <h1>Phone Passkeys</h1>
+    <p id="status">Checking the native host…</p>
+    <p>When a site asks for a passkey, a window with a QR code opens. Scan it with the phone or tablet that holds the passkey.</p>
+    <p><a href="https://webauthn.io" target="_blank" rel="noopener">Try it on webauthn.io</a> · <a href="#" id="setup">Setup instructions</a></p>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Phone Passkeys</title>
+  <link rel="stylesheet" href="dialog.css">
+</head>
+<body>
+  <main class="sheet">
+    <h1 id="heading">Use a passkey</h1>
+
+    <section class="option">
+      <div class="option-head">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 8.5A2.5 2.5 0 0 1 6.5 6H8l1.2-2h5.6L16 6h1.5A2.5 2.5 0 0 1 20 8.5v8A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5z"/>
+          <circle cx="12" cy="12.5" r="3.2"/>
+        </svg>
+        <div>
+          <h2>Use your phone or tablet</h2>
+          <p>Scan this QR code with the camera on the device that has your passkey for <strong class="rp"></strong></p>
+        </div>
+      </div>
+      <div id="qr" class="qr">
+        <div id="qr-placeholder" class="placeholder"><div class="spinner"></div></div>
+        <img id="qr-img" alt="QR code" hidden>
+        <div id="qr-badge" class="badge" hidden>
+          <svg viewBox="0 0 48 48" aria-hidden="true">
+            <circle cx="19" cy="15" r="8" fill="#1f1f1f"/>
+            <path d="M3 41c0-8.8 7.2-14 16-14 3.2 0 6.1.7 8.5 2.1A10 10 0 0 0 27 35v6z" fill="#1f1f1f"/>
+            <circle cx="36" cy="27" r="6" fill="#1f1f1f"/>
+            <path d="M34 32h4v10l-2 2-2-2 1.5-1.5L34 39l1.5-1.5L34 36z" fill="#1f1f1f"/>
+          </svg>
+        </div>
+        <div class="check">
+          <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="#1e8e3e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>Code scanned</span>
+        </div>
+      </div>
+      <p id="status" class="status">Preparing a QR code…</p>
+    </section>
+
+    <hr>
+
+    <section class="option">
+      <div class="option-head">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="8" y="2.5" width="8" height="6" rx="1"/>
+          <rect x="5" y="8.5" width="14" height="13" rx="2"/>
+          <circle cx="12" cy="15" r="2"/>
+        </svg>
+        <div>
+          <h2>Use your security key</h2>
+          <p>Insert and touch your security key to use it for <strong class="rp"></strong></p>
+          <div class="secondary-row"><button id="use-key" type="button">Use security key</button></div>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <button id="cancel" type="button" class="primary">Cancel</button>
+    </footer>
+  </main>
+  <script src="dialog.js"></script>
+</body>
+</html>

@@ -1,0 +1,68 @@
+{
+  "manifest_version": 2,
+  "name": "Phone Passkeys",
+  "version": "0.1.0",
+  "description": "Use passkeys stored on your phone or tablet by scanning a QR code (WebAuthn hybrid transport) in Zen and Firefox on Linux.",
+  "homepage_url": "https://github.com/zen-extensions/phone-passkeys",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "phone-passkeys@zen-extensions.local",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
+  },
+  "permissions": [
+    "nativeMessaging",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": true
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "page.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "browser_action": {
+    "default_icon": {
+      "48": "icons/icon-48.png",
+      "96": "icons/icon-96.png"
+    },
+    "default_title": "Phone Passkeys",
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "setup.html",
+    "open_in_tab": true
+  }
+}

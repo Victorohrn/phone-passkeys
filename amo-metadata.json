@@ -1,0 +1,32 @@
+{
+  "name": {
+    "en-US": "Phone Passkeys"
+  },
+  "summary": {
+    "en-US": "Sign in with the passkeys on your phone or tablet by scanning a QR code, in Zen and Firefox on Linux. Adds the WebAuthn hybrid transport that Firefox lacks on Linux. Requires a small open-source native host."
+  },
+  "description": {
+    "en-US": "Firefox on Linux cannot use passkeys stored on a phone: the \"scan this QR code with your phone\" option that Chrome offers is missing. Phone Passkeys adds it.\n\nWhen a site asks for a passkey, a window with a QR code opens. Scan it with the phone or tablet that holds the passkey (Android with Google Password Manager, or iPhone/iPad with iCloud Keychain), approve on the phone, and you are signed in. Registering new passkeys on the phone works the same way. A \"Use security key\" button hands the request back to Firefox for USB keys.\n\nHow it works: the extension routes WebAuthn requests to a small open-source native host on your computer. The host shows the QR code, confirms the phone is nearby over Bluetooth, and relays the sign-in through the phone vendor's tunnel server, end-to-end encrypted between your computer and the phone. This is the standard FIDO hybrid transport (caBLE) that Chrome, Edge and Safari implement.\n\nRequirements: Linux with Bluetooth, and the native host from the project page (built from source with Rust, or a prebuilt release). Until the host is installed, passkey requests are passed through to Firefox unchanged.\n\nPrivacy: the extension collects no data and contacts no servers. The host only talks to the vendor tunnel server during a sign-in and may fetch a site's /.well-known/webauthn file to honour related origins.\n\nNot yet supported: passkey autofill (conditional UI) and \"remember this phone\"."
+  },
+  "categories": {
+    "firefox": [
+      "privacy-security"
+    ]
+  },
+  "homepage": {
+    "en-US": "https://github.com/zen-extensions/phone-passkeys"
+  },
+  "is_experimental": false,
+  "requires_payment": false,
+  "default_locale": "en-US",
+  "version": {
+    "license": "MPL-2.0",
+    "release_notes": {
+      "en-US": "Initial release: phone/tablet passkeys over the WebAuthn hybrid transport (QR code + Bluetooth proximity), registration and sign-in, security-key fallback, setup page."
+    },
+    "approval_notes": "# Notes for AMO reviewers\n\nPhone Passkeys adds the WebAuthn *hybrid* transport (\"use your phone or tablet\",\nQR code + Bluetooth proximity + vendor tunnel) to Firefox-based browsers on\nLinux, where Firefox does not implement it. It is the same user flow Chrome\noffers natively.\n\n## Architecture\n\n- `page.js` (content script, `world: \"MAIN\"`): replaces\n  `navigator.credentials.get()` / `create()` for WebAuthn (`publicKey`)\n  requests. Requests with `mediation: \"conditional\"` and non-WebAuthn\n  credentials are passed to the browser's own implementation untouched.\n- `bridge.js` (isolated world): relays the request to the background script.\n- `background.js`: takes the origin from the port sender (the browser's own\n  view of the frame, never page data), opens a dialog window with the QR code,\n  and talks to a native messaging host.\n- `host/` (Rust, same repository, LGPL-2.1): performs the ceremony with the\n  open-source `libwebauthn` crate from the Credentials-for-Linux project.\n\n## Why these permissions\n\n- `nativeMessaging`: browser extensions cannot listen for Bluetooth\n  advertisements or run the CTAP protocol; the native host does that.\n- `<all_urls>` content scripts: any site may use WebAuthn, so the override must\n  be present everywhere, exactly like password-manager extensions that provide\n  passkeys. The content script only acts when a page calls the WebAuthn API.\n- `world: \"MAIN\"` is required to replace a page-visible API.\n\n## Data and network\n\n- The extension collects nothing (`data_collection_permissions: none`) and\n  makes no network requests itself.\n- The native host connects to the phone vendor's caBLE tunnel server\n  (`cable.ua5v.com` for Google, `cable.auth.com` for Apple) during a sign-in,\n  as every hybrid-transport client does. Traffic inside the tunnel is\n  end-to-end encrypted between the computer and the phone (Noise protocol).\n  The host may also fetch `https://<rp-id>/.well-known/webauthn` to honour\n  WebAuthn Related Origin Requests.\n- No remote code is loaded. All JavaScript is unminified and in the package.\n\n## Behaviour without the native host\n\nIf the host is not installed, the first intercepted request is handed back to\nthe browser's own WebAuthn implementation (`useNative`) and a setup tab opens\nonce. Built-in authenticators and security keys therefore keep working after\ninstalling the extension alone.\n\n## How to test\n\n1. Linux machine with a Bluetooth adapter; Android phone (Google Password\n   Manager) or iPhone (iCloud Keychain).\n2. Build and register the host: `./install.sh --host-only` (needs Rust).\n3. Open https://webauthn.io → Register. The QR dialog opens; scan it with the\n   phone and approve. Then Authenticate with the same passkey.\n4. The toolbar popup and the setup page (add-on preferences) report whether\n   the host is installed and Bluetooth is available.\n",
+    "compatibility": [
+      "firefox"
+    ]
+  }
+}

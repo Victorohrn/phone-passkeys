@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Set up Phone Passkeys</title>
+  <link rel="stylesheet" href="setup.css">
+</head>
+<body>
+  <main class="page">
+    <header>
+      <img src="icons/icon-96.png" alt="" width="48" height="48">
+      <div>
+        <h1>Set up Phone Passkeys</h1>
+        <p>Use the passkeys on your phone or tablet by scanning a QR code, in Zen and Firefox on Linux.</p>
+      </div>
+    </header>
+
+    <section class="card" id="status-card">
+      <h2>Native host</h2>
+      <p id="status">Checking…</p>
+      <p class="muted">The extension needs a small helper program on your computer. It generates the QR code, listens for your phone over Bluetooth and relays the sign-in through the vendor's secure tunnel. Browser extensions cannot use Bluetooth on their own.</p>
+      <button id="recheck" type="button">Check again</button>
+    </section>
+
+    <section class="card">
+      <h2>1. Requirements</h2>
+      <ul>
+        <li>Linux with Bluetooth turned on (BlueZ). Bluetooth is only used to confirm the phone is nearby.</li>
+        <li>A phone or tablet with passkeys: Android (Google Password Manager) or iPhone/iPad (iCloud Keychain).</li>
+        <li>To build the helper: Rust (<code>cargo</code>), <code>pkg-config</code>, OpenSSL and D-Bus development headers.</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>2. Install the native host</h2>
+      <p>Get the source and run the installer. It builds the helper and registers it with the browser (under <code>~/.mozilla/native-messaging-hosts</code>).</p>
+      <pre><code>git clone https://github.com/zen-extensions/phone-passkeys.git
+cd phone-passkeys
+./install.sh --host-only</code></pre>
+      <p class="muted">Prebuilt binaries, when available, are listed on the project's releases page.</p>
+    </section>
+
+    <section class="card">
+      <h2>3. Check and try it</h2>
+      <p>Click <em>Check again</em> above. When the host is found, open <a href="https://webauthn.io" target="_blank" rel="noopener">webauthn.io</a> and choose <em>Register</em> or <em>Authenticate</em>. A window with a QR code appears; scan it with the phone that holds your passkey.</p>
+      <p class="muted">Until the host is installed, passkey requests are handed back to the browser unchanged, so security keys and everything else keep working.</p>
+    </section>
+
+    <section class="card">
+      <h2>Privacy</h2>
+      <p>The extension collects no data and contacts no servers itself. During a sign-in the native host talks to the tunnel server of your phone's vendor (Google or Apple) exactly as Chrome does; everything inside the tunnel is end-to-end encrypted between this computer and your phone. The host may also fetch <code>/.well-known/webauthn</code> from a site to honour its related origins.</p>
+    </section>
+  </main>
+  <script src="setup.js"></script>
+</body>
+</html>
