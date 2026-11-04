@@ -174,6 +174,11 @@ async fn run_inner(
         }
     };
     info!(cmd = %req.cmd, origin = %req.origin, rp_id = prepared.rp_id(), "request prepared");
+    debug!(top_origin = ?req.top_origin, options = %options_json, "request options as received");
+    match &prepared {
+        Prepared::Create(r) => debug!(request = ?r, client_data = %r.client_data_json(), "prepared create request"),
+        Prepared::Get(r) => debug!(request = ?r, client_data = %r.client_data_json(), "prepared get request"),
+    }
 
     let timeout = prepared.timeout().clamp(MIN_TIMEOUT, MAX_TIMEOUT);
     let deadline = Instant::now() + timeout;
@@ -193,7 +198,11 @@ async fn run_inner(
         send_state(writer, &req.id, "waiting", None);
 
         match attempt(&mut device, &prepared, &req.id, writer, cancel, deadline).await {
-            Ok(credential) => return Ok(finalize(is_create, credential)),
+            Ok(credential) => {
+                let credential = finalize(is_create, credential);
+                debug!(credential = %credential, "credential returned to the browser");
+                return Ok(credential);
+            }
             Err(Outcome::Fatal(failure)) => return Err(failure),
             Err(Outcome::Retry(reason)) => {
                 if attempts >= MAX_ATTEMPTS || Instant::now() >= deadline {
@@ -304,7 +313,7 @@ async fn forward_updates(
     loop {
         match rx.recv().await {
             Ok(HybridUxUpdate::PxpUpdate(update)) => {
-                debug!(?update, "hybrid transport update");
+                info!(?update, "hybrid transport update");
                 #[allow(unreachable_patterns)]
                 match update {
                     PxpUpdate::ProximityCheck => send_state(&writer, &id, "waiting", None),

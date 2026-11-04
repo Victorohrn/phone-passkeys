@@ -1,0 +1,166 @@
+use async_trait::async_trait;
+use std::sync::Arc;
+use std::{collections::VecDeque, fmt::Display, time::Duration};
+use tokio::sync::broadcast;
+use tokio::time::sleep;
+
+use crate::{
+    pin::persistent_token::PersistentTokenStore,
+    proto::{
+        ctap1::apdu::{ApduRequest, ApduResponse},
+        ctap2::cbor::{CborRequest, CborResponse},
+    },
+    transport::{
+        device::SupportedProtocols, AuthTokenData, Channel, ChannelStatus, Ctap2AuthTokenStore,
+    },
+    webauthn::WebAuthnError,
+    UvUpdate,
+};
+use std::convert::Infallible;
+
+pub struct MockChannel {
+    expected_requests: VecDeque<CborRequest>,
+    responses: VecDeque<CborResponse>,
+    auth_token_data: Option<AuthTokenData>,
+    cred_mgmt_preview: bool,
+    persistent_token_store: Option<Arc<dyn PersistentTokenStore>>,
+    ux_update_sender: broadcast::Sender<UvUpdate>,
+    pre_send_delay: Option<Duration>,
+}
+
+impl Default for MockChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockChannel {
+    pub fn new() -> Self {
+        let (ux_update_sender, _) = broadcast::channel(16);
+        Self {
+            expected_requests: VecDeque::new(),
+            responses: VecDeque::new(),
+            auth_token_data: None,
+            cred_mgmt_preview: false,
+            persistent_token_store: None,
+            ux_update_sender,
+            pre_send_delay: None,
+        }
+    }
+
+    pub fn push_command_pair(&mut self, expected_request: CborRequest, response: CborResponse) {
+        self.expected_requests.push_front(expected_request);
+        self.responses.push_front(response);
+    }
+
+    pub fn set_persistent_token_store(&mut self, store: Arc<dyn PersistentTokenStore>) {
+        self.persistent_token_store = Some(store);
+    }
+
+    /// Make `cbor_send` sleep for `delay` before completing, modeling a transport that defers the actual send behind a handshake.
+    pub fn set_pre_send_delay(&mut self, delay: Duration) {
+        self.pre_send_delay = Some(delay);
+    }
+}
+
+impl Ctap2AuthTokenStore for MockChannel {
+    fn store_auth_data(&mut self, auth_token_data: AuthTokenData) {
+        self.auth_token_data = Some(auth_token_data);
+    }
+
+    fn get_auth_data(&self) -> Option<&AuthTokenData> {
+        self.auth_token_data.as_ref()
+    }
+
+    fn clear_uv_auth_token_store(&mut self) {
+        self.auth_token_data = None;
+    }
+
+    fn set_cred_mgmt_preview(&mut self, uses_preview: bool) {
+        self.cred_mgmt_preview = uses_preview;
+    }
+
+    fn cred_mgmt_preview(&self) -> bool {
+        self.cred_mgmt_preview
+    }
+
+    fn persistent_token_store(&self) -> Option<Arc<dyn PersistentTokenStore>> {
+        self.persistent_token_store.clone()
+    }
+}
+
+impl Display for MockChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TestChannel")
+    }
+}
+
+#[async_trait]
+impl Channel for MockChannel {
+    type UxUpdate = UvUpdate;
+    type TransportError = Infallible;
+
+    fn get_ux_update_sender(&self) -> &broadcast::Sender<Self::UxUpdate> {
+        &self.ux_update_sender
+    }
+
+    async fn supported_protocols(
+        &self,
+    ) -> Result<SupportedProtocols, WebAuthnError<Self::TransportError>> {
+        Ok(SupportedProtocols {
+            u2f: false,
+            fido2: true,
+        })
+    }
+    async fn status(&self) -> ChannelStatus {
+        unimplemented!();
+    }
+    async fn close(&mut self) {
+        unimplemented!();
+    }
+
+    async fn apdu_send(
+        &mut self,
+        _request: &ApduRequest,
+        _timeout: Duration,
+    ) -> Result<(), Self::TransportError> {
+        unimplemented!();
+    }
+    async fn apdu_recv(
+        &mut self,
+        _timeout: Duration,
+    ) -> Result<ApduResponse, Self::TransportError> {
+        unimplemented!();
+    }
+
+    async fn cbor_send(
+        &mut self,
+        request: &CborRequest,
+        _timeout: Duration,
+    ) -> Result<(), Self::TransportError> {
+        if let Some(delay) = self.pre_send_delay {
+            sleep(delay).await;
+        }
+        let expected = self
+            .expected_requests
+            .pop_back()
+            .expect("No expected request found, but one was sent");
+        assert_eq!(
+            &expected,
+            request,
+            "{} items still in the queue. Left: Expected, Right: Received",
+            self.expected_requests.len()
+        );
+        Ok(())
+    }
+    async fn cbor_recv(
+        &mut self,
+        _timeout: Duration,
+    ) -> Result<CborResponse, Self::TransportError> {
+        let response = self
+            .responses
+            .pop_back()
+            .expect("No response found, but one was requested");
+        Ok(response)
+    }
+}

@@ -1,0 +1,196 @@
+use std::convert::TryInto;
+use std::fmt::{Display, Formatter};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::fido::FidoRevision;
+use crate::pin::persistent_token::PersistentTokenStore;
+use crate::proto::ctap1::apdu::{ApduRequest, ApduResponse};
+use crate::proto::ctap2::cbor::{CborRequest, CborResponse};
+use crate::transport::ble::btleplug;
+use crate::transport::ble::error::BleError;
+use crate::transport::channel::{
+    AuthTokenData, Channel, ChannelSettings, ChannelStatus, Ctap2AuthTokenStore,
+};
+use crate::transport::device::SupportedProtocols;
+use crate::webauthn::error::WebAuthnError;
+use crate::Transport;
+use crate::UvUpdate;
+
+use super::btleplug::manager::SupportedRevisions;
+use super::btleplug::Connection;
+use super::framing::{BleCommand, BleFrame};
+use super::BleDevice;
+
+use async_trait::async_trait;
+use tokio::sync::broadcast;
+use tracing::{debug, instrument, trace, Level};
+
+#[derive(Debug)]
+pub struct BleChannel<'a> {
+    status: ChannelStatus,
+    device: &'a BleDevice,
+    connection: Connection,
+    revision: FidoRevision,
+    auth_token_data: Option<AuthTokenData>,
+    cred_mgmt_preview: bool,
+    persistent_token_store: Option<Arc<dyn PersistentTokenStore>>,
+    ux_update_sender: broadcast::Sender<UvUpdate>,
+}
+
+impl<'a> BleChannel<'a> {
+    pub async fn new(
+        device: &'a BleDevice,
+        revisions: &SupportedRevisions,
+        settings: ChannelSettings,
+    ) -> Result<BleChannel<'a>, WebAuthnError<BleError>> {
+        let (ux_update_sender, _) = broadcast::channel(16);
+
+        let revision = revisions
+            .select_best()
+            .ok_or(WebAuthnError::Transport(BleError::NegotiationFailed))?;
+        let connection = btleplug::connect(&device.btleplug_device.peripheral, &revision)
+            .await
+            .map_err(|e| WebAuthnError::Transport(BleError::Gatt(e)))?;
+        let channel = BleChannel {
+            status: ChannelStatus::Ready,
+            device,
+            connection,
+            revision,
+            auth_token_data: None,
+            cred_mgmt_preview: false,
+            persistent_token_store: settings.persistent_token_store,
+            ux_update_sender,
+        };
+        channel
+            .connection
+            .subscribe()
+            .await
+            .map_err(|e| WebAuthnError::Transport(BleError::Gatt(e)))?;
+        Ok(channel)
+    }
+}
+
+impl Display for BleChannel<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.device.fmt(f)
+    }
+}
+
+#[async_trait]
+impl<'a> Channel for BleChannel<'a> {
+    type UxUpdate = UvUpdate;
+    type TransportError = BleError;
+
+    fn transport(&self) -> Transport {
+        Transport::Ble
+    }
+
+    async fn supported_protocols(&self) -> Result<SupportedProtocols, WebAuthnError<BleError>> {
+        Ok(self.revision.into())
+    }
+
+    async fn status(&self) -> ChannelStatus {
+        self.status
+    }
+
+    async fn close(&mut self) {
+        // BLE disconnection is handled when the Connection is dropped
+        trace!("BLE channel close() called — no-op, cleanup on drop");
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all)]
+    async fn apdu_send(
+        &mut self,
+        request: &ApduRequest,
+        _timeout: Duration,
+    ) -> Result<(), BleError> {
+        debug!(rev = ?self.revision, "Sending APDU request");
+        trace!(?request, "Sending APDU request");
+
+        let request_apdu_packet = request.raw_long()?;
+        let request_frame = BleFrame::new(BleCommand::Msg, &request_apdu_packet);
+        self.connection.frame_send(&request_frame).await?;
+        Ok(())
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all)]
+    async fn apdu_recv(&mut self, timeout: Duration) -> Result<ApduResponse, BleError> {
+        let response_frame = self.connection.frame_recv(timeout).await?;
+
+        match response_frame.cmd {
+            BleCommand::Error => return Err(BleError::UnexpectedFrame), // Encapsulation layer error
+            BleCommand::Cancel => return Err(BleError::Cancelled),
+            BleCommand::Keepalive | BleCommand::Ping => return Err(BleError::UnexpectedFrame),
+            BleCommand::Msg => {}
+        }
+        let response_apdu_packet = &response_frame.data;
+        let response_apdu: ApduResponse = response_apdu_packet.try_into()?;
+
+        debug!("Received APDU response");
+        trace!(?response_apdu, "Received APDU response");
+        Ok(response_apdu)
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all)]
+    async fn cbor_send(
+        &mut self,
+        request: &CborRequest,
+        _timeout: std::time::Duration,
+    ) -> Result<(), BleError> {
+        debug!("Sending CBOR request");
+        trace!(?request, "Sending CBOR request");
+
+        let cbor_request = request.raw_long()?;
+        let request_frame = BleFrame::new(BleCommand::Msg, &cbor_request);
+        self.connection.frame_send(&request_frame).await?;
+        Ok(())
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all)]
+    async fn cbor_recv(&mut self, timeout: std::time::Duration) -> Result<CborResponse, BleError> {
+        let response_frame = self.connection.frame_recv(timeout).await?;
+        match response_frame.cmd {
+            BleCommand::Error => return Err(BleError::UnexpectedFrame), // Encapsulation layer error
+            BleCommand::Cancel => return Err(BleError::Cancelled),
+            BleCommand::Keepalive | BleCommand::Ping => return Err(BleError::UnexpectedFrame),
+            BleCommand::Msg => {}
+        }
+        let cbor_response_packet = &response_frame.data;
+        let cbor_response: CborResponse = cbor_response_packet.try_into()?;
+
+        debug!("Received CBOR response");
+        trace!(?cbor_response, "Received CBOR response");
+        Ok(cbor_response)
+    }
+
+    fn get_ux_update_sender(&self) -> &broadcast::Sender<Self::UxUpdate> {
+        &self.ux_update_sender
+    }
+}
+
+impl Ctap2AuthTokenStore for BleChannel<'_> {
+    fn store_auth_data(&mut self, auth_token_data: AuthTokenData) {
+        self.auth_token_data = Some(auth_token_data);
+    }
+
+    fn get_auth_data(&self) -> Option<&AuthTokenData> {
+        self.auth_token_data.as_ref()
+    }
+
+    fn clear_uv_auth_token_store(&mut self) {
+        self.auth_token_data = None;
+    }
+
+    fn set_cred_mgmt_preview(&mut self, uses_preview: bool) {
+        self.cred_mgmt_preview = uses_preview;
+    }
+
+    fn cred_mgmt_preview(&self) -> bool {
+        self.cred_mgmt_preview
+    }
+
+    fn persistent_token_store(&self) -> Option<Arc<dyn PersistentTokenStore>> {
+        self.persistent_token_store.clone()
+    }
+}

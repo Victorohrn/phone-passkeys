@@ -1,0 +1,214 @@
+use std::fmt::{Debug, Display};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::pin::persistent_token::PersistentTokenStore;
+use crate::proto::ctap2::{
+    Ctap2AuthTokenPermissionRole, Ctap2PinUvAuthProtocol, Ctap2UserVerificationOperation,
+};
+use crate::proto::{
+    ctap1::apdu::{ApduRequest, ApduResponse},
+    ctap2::cbor::{CborRequest, CborResponse},
+};
+use crate::webauthn::error::WebAuthnError;
+use crate::Transport;
+use crate::UvUpdate;
+
+use async_trait::async_trait;
+use cosey::PublicKey;
+use tokio::sync::broadcast;
+use tracing::{instrument, trace, warn, Level};
+
+use super::device::SupportedProtocols;
+
+#[derive(Debug, Copy, Clone)]
+pub enum ChannelStatus {
+    Ready, // Channels are created asynchrounously, and are always ready.
+    Processing,
+    Closed,
+}
+
+/// Per-channel configuration supplied by the caller when opening a channel via
+/// [`Device::channel`](crate::transport::Device::channel). Transport-agnostic, so the
+/// same options apply to HID, BLE, NFC, and hybrid (caBLE).
+#[derive(Debug, Default, Clone)]
+pub struct ChannelSettings {
+    /// Caller-supplied store for persistent pinUvAuthTokens (pcmr). When set, read-only
+    /// credential management reuses a stored token across sessions instead of
+    /// re-prompting for the PIN. See [`PersistentTokenStore`].
+    pub persistent_token_store: Option<Arc<dyn PersistentTokenStore>>,
+}
+
+#[async_trait]
+pub trait Channel: Send + Sync + Display + Ctap2AuthTokenStore {
+    /// UX updates for this channel, must include UV updates.
+    type UxUpdate: Send + Sync + Debug + From<UvUpdate>;
+
+    /// Per-transport concrete error. Set by each transport to its own enum.
+    type TransportError: std::error::Error + Send + Sync + 'static;
+
+    /// Broadcast sender fanning UX updates out to subscribed receivers.
+    fn get_ux_update_sender(&self) -> &broadcast::Sender<Self::UxUpdate>;
+
+    /// Subscribe to this channel's UX updates; drive the receiver on a separate task so the ceremony can make progress.
+    fn get_ux_update_receiver(&self) -> broadcast::Receiver<Self::UxUpdate> {
+        self.get_ux_update_sender().subscribe()
+    }
+
+    /// Broadcast a UX update to all current receivers.
+    #[instrument(level = Level::INFO, skip_all)]
+    async fn send_ux_update(&mut self, state: Self::UxUpdate) {
+        trace!(?state, "Sending UX update");
+        match self.get_ux_update_sender().send(state) {
+            Ok(_) => (),
+            Err(_) => {
+                warn!("No receivers for UX update");
+            }
+        };
+    }
+
+    async fn supported_protocols(
+        &self,
+    ) -> Result<SupportedProtocols, WebAuthnError<Self::TransportError>>;
+    async fn status(&self) -> ChannelStatus;
+    async fn close(&mut self);
+
+    /// The transport this channel speaks over. Drives the registration response
+    /// `transports` member and the `authenticatorAttachment` of both registration
+    /// and assertion responses.
+    fn transport(&self) -> Transport {
+        Transport::Usb
+    }
+
+    async fn apdu_send(
+        &mut self,
+        request: &ApduRequest,
+        timeout: Duration,
+    ) -> Result<(), Self::TransportError>;
+    async fn apdu_recv(&mut self, timeout: Duration) -> Result<ApduResponse, Self::TransportError>;
+
+    async fn cbor_send(
+        &mut self,
+        request: &CborRequest,
+        timeout: Duration,
+    ) -> Result<(), Self::TransportError>;
+    async fn cbor_recv(&mut self, timeout: Duration) -> Result<CborResponse, Self::TransportError>;
+
+    /// Allows channels to disable support for pre-flight requests
+    fn supports_preflight() -> bool {
+        true
+    }
+
+    // Default no-op implementations for these, as we currently only have a test device
+    // for HidChannel, and that will override these default implementations.
+    #[cfg(feature = "virt")]
+    fn set_forced_pin_protocol(&mut self, _protocols: Ctap2PinUvAuthProtocol) {}
+
+    #[cfg(feature = "virt")]
+    fn get_forced_pin_protocol(&mut self) -> Option<Ctap2PinUvAuthProtocol> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ctap2AuthTokenPermission {
+    pub(crate) pin_uv_auth_protocol: Ctap2PinUvAuthProtocol,
+    pub(crate) role: Ctap2AuthTokenPermissionRole,
+    pub(crate) rpid: Option<String>,
+}
+
+impl Ctap2AuthTokenPermission {
+    pub fn new(
+        pin_uv_auth_protocol: Ctap2PinUvAuthProtocol,
+        permissions: Ctap2AuthTokenPermissionRole,
+        permissions_rpid: Option<&str>,
+    ) -> Self {
+        Self {
+            pin_uv_auth_protocol,
+            role: permissions,
+            rpid: permissions_rpid.map(str::to_string),
+        }
+    }
+
+    pub fn contains(&self, requested: &Ctap2AuthTokenPermission) -> bool {
+        if self.pin_uv_auth_protocol != requested.pin_uv_auth_protocol {
+            return false;
+        }
+        if self.rpid != requested.rpid {
+            return false;
+        }
+        self.role.contains(requested.role)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthTokenData {
+    pub protocol_version: Ctap2PinUvAuthProtocol,
+    pub key_agreement: PublicKey,
+    pub shared_secret: Vec<u8>,
+    pub uv_operation: Ctap2UserVerificationOperation,
+    pub permission: Option<Ctap2AuthTokenPermission>,
+    pub pin_uv_auth_token: Option<Vec<u8>>,
+}
+
+impl AuthTokenData {
+    pub fn new(
+        shared_secret: Vec<u8>,
+        protocol_version: Ctap2PinUvAuthProtocol,
+        key_agreement: PublicKey,
+        uv_operation: Ctap2UserVerificationOperation,
+    ) -> Self {
+        Self {
+            protocol_version,
+            key_agreement,
+            shared_secret,
+            uv_operation,
+            permission: None,
+            pin_uv_auth_token: None,
+        }
+    }
+
+    pub fn store_auth_token(
+        &mut self,
+        permission: Ctap2AuthTokenPermission,
+        pin_uv_auth_token: Vec<u8>,
+    ) {
+        self.permission = Some(permission);
+        self.pin_uv_auth_token = Some(pin_uv_auth_token);
+    }
+}
+
+#[async_trait]
+pub trait Ctap2AuthTokenStore {
+    fn store_auth_data(&mut self, auth_token_data: AuthTokenData);
+    fn get_auth_data(&self) -> Option<&AuthTokenData>;
+    fn clear_uv_auth_token_store(&mut self);
+    /// Command set resolved by the last credMgmt state-initializing request, so
+    /// stateful GetNext continuations reuse it without re-fetching getInfo.
+    fn set_cred_mgmt_preview(&mut self, uses_preview: bool);
+    fn cred_mgmt_preview(&self) -> bool;
+    fn get_uv_auth_token(&self, requested_permission: &Ctap2AuthTokenPermission) -> Option<&[u8]> {
+        if let Some(stored_data) = self.get_auth_data() {
+            if let Some(permission) = &stored_data.permission {
+                if permission.contains(requested_permission) {
+                    return stored_data.pin_uv_auth_token.as_deref();
+                }
+            }
+        }
+        None
+    }
+    fn used_pin_for_auth(&self) -> bool {
+        if let Some(stored_data) = self.get_auth_data() {
+            return stored_data.uv_operation
+                == Ctap2UserVerificationOperation::GetPinUvAuthTokenUsingPinWithPermissions
+                || stored_data.uv_operation == Ctap2UserVerificationOperation::GetPinToken;
+        }
+        false
+    }
+
+    /// Caller-supplied persistent pinUvAuthToken (pcmr) store, if one is configured.
+    /// Defaults to `None`; only channels wired with a store override this.
+    fn persistent_token_store(&self) -> Option<Arc<dyn PersistentTokenStore>> {
+        None
+    }
+}

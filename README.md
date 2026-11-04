@@ -27,6 +27,12 @@ The ceremony itself (QR encoding, BLE scan, tunnel, Noise, CTAP2) is done by
 behind the Credentials-for-Linux project. This repo only adds the browser glue
 and a dialog. Nothing is installed system-wide: no daemon, no portal patches.
 
+The host builds against a vendored copy of libwebauthn (`host/vendor/`) that
+adds the native `largeBlob` extension phones implement. Apple's sign-in
+(icloud.com, Apple Account) stores device keys in the passkey's large blob and
+fails with "Your browser needs to be updated" without it. `host/VENDOR.md`
+describes the patch; it is meant to go upstream.
+
 ## Requirements
 
 - Zen, or Firefox 140 or newer (needed for the `world: "MAIN"` content script and the data-collection manifest key; Zen 1.23 is on Firefox 158).
@@ -108,6 +114,8 @@ waits for your phone or cancels after `--wait` seconds. It exits non-zero if
 the host misbehaves (no QR, no clean cancel, no clean exit).
 
 Unit tests for the host: `cargo test --manifest-path host/Cargo.toml`.
+Tests of the vendored libwebauthn (including the largeBlob patch):
+`cargo test --lib --manifest-path host/vendor/libwebauthn/Cargo.toml`.
 
 ## Troubleshooting
 
@@ -118,6 +126,10 @@ Unit tests for the host: `cargo test --manifest-path host/Cargo.toml`.
   `bluetoothctl power on`. BlueZ is accessed over D-Bus; no root needed.
 - **Logs.** The host logs to stderr, which Zen shows in the Browser Console
   (Ctrl+Shift+J). Set `PHONE_PASSKEYS_LOG=debug` when running the smoke test.
+  For a persistent debug log of the host as Zen launches it, create
+  `~/.config/phone-passkeys/debug`; the host then appends a debug log
+  (including the CTAP exchange with the phone) to
+  `~/.cache/phone-passkeys/host.log`. Remove the flag file when done.
 - **A site does not detect passkey support.** `page.js` reports a platform
   authenticator as available (`CLAIM_PLATFORM_AUTHENTICATOR`) so that sites
   offer passkey sign-in; flip the constant if a site misbehaves.
@@ -171,6 +183,7 @@ release. That gives store users a download instead of a Rust build.
 ```
 extension/          WebExtension (manifest v2, Firefox/Zen)
 host/               Rust native messaging host (libwebauthn)
+host/vendor/        libwebauthn with the native largeBlob patch (host/VENDOR.md)
 tools/              packaging script, host smoke test, page.js unit test
 install.sh          build + register (+ package)
 sign.sh             sign / submit through addons.mozilla.org

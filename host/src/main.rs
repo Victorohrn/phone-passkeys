@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use messaging::Writer;
 
@@ -44,13 +44,8 @@ struct Active {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("PHONE_PASSKEYS_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-    info!(version = env!("CARGO_PKG_VERSION"), "phone-passkeys-host starting");
+    init_logging();
+    info!(version = env!("CARGO_PKG_VERSION"), pid = std::process::id(), "phone-passkeys-host starting");
 
     let writer = Arc::new(Writer::new());
     let psl: Arc<dyn PublicSuffixList> = Arc::from(suffix_list::load());
@@ -136,4 +131,45 @@ async fn handle_message(
         }
         other => warn!(%other, "ignoring unknown message type"),
     }
+}
+
+/// Logs go to stderr (the browser shows it in the Browser Console) at the level
+/// in `PHONE_PASSKEYS_LOG`, default `info`. Browsers start the host without a
+/// controllable environment, so a debug log file can be switched on by creating
+/// `~/.config/phone-passkeys/debug`; it is appended to
+/// `~/.cache/phone-passkeys/host.log`.
+fn init_logging() {
+    let stderr_filter =
+        EnvFilter::try_from_env("PHONE_PASSKEYS_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    let stderr_layer = fmt::layer().with_writer(std::io::stderr).with_filter(stderr_filter);
+    let file_layer = debug_log_file().map(|file| {
+        fmt::layer()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .with_filter(EnvFilter::new(
+                "debug,libwebauthn::proto=trace,libwebauthn::ops::webauthn::large_blob=trace,pxp::protocol=trace,hyper=info,hyper_util=info,h2=info,rustls=info,reqwest=info,tungstenite=info,tokio_tungstenite=info,zbus=info,tracing=info",
+            ))
+    });
+    tracing_subscriber::registry().with(stderr_layer).with(file_layer).init();
+}
+
+fn debug_log_file() -> Option<std::fs::File> {
+    use std::path::PathBuf;
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    if !config_dir.join("phone-passkeys").join("debug").exists() {
+        return None;
+    }
+    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache"))
+        .join("phone-passkeys");
+    std::fs::create_dir_all(&cache_dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cache_dir.join("host.log"))
+        .ok()
 }

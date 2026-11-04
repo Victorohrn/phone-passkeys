@@ -1,0 +1,1812 @@
+use std::{collections::HashMap, time::Duration};
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tracing::{debug, trace, warn};
+
+use crate::{
+    fido::AuthenticatorData,
+    ops::webauthn::{
+        client_data::ClientData,
+        idl::{
+            appid_authorised,
+            get::{
+                HmacGetSecretInputJson, LargeBlobInputJson, PrfInputJson,
+                PublicKeyCredentialRequestOptionsJSON,
+            },
+            response::{
+                AuthenticationExtensionsClientOutputsJSON, AuthenticationResponseJSON,
+                AuthenticatorAssertionResponseJSON, HMACGetSecretOutputJSON, LargeBlobOutputJSON,
+                PRFOutputJSON, PRFValuesJSON, ResponseSerializationError, WebAuthnIDLResponse,
+            },
+            rp_id_authorised, Base64UrlString, FromIdlModel, JsonError, RequestSettings,
+        },
+        Operation,
+    },
+    pin::PinUvAuthProtocol,
+    proto::ctap2::{
+        Ctap2GetAssertionResponseExtensions, Ctap2PublicKeyCredentialDescriptor,
+        Ctap2PublicKeyCredentialUserEntity,
+    },
+    webauthn::CtapError,
+    Transport,
+};
+
+use super::timeout::DEFAULT_TIMEOUT;
+use super::{
+    DowngradableRequest, PublicKeyCredentialHint, RelyingPartyId, RequestOrigin, SignRequest,
+    UserVerificationRequirement,
+};
+
+/// PRF extension input salts. Per W3C WebAuthn L3 §10.1.4, these are
+/// `BufferSource`s "of any length"; the client hashes them via
+/// `SHA-256(UTF8Encode("WebAuthn PRF") || 0x00 || input)` before feeding the
+/// resulting 32 bytes to CTAP2 hmac-secret.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PrfInputValue {
+    pub first: Vec<u8>,
+    pub second: Option<Vec<u8>>,
+}
+
+/// PRF extension output values. Per CTAP2.1 §6.5.6 hmac-secret, each slot is
+/// exactly 32 bytes.
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct PrfOutputValue {
+    #[serde(with = "serde_bytes")]
+    pub first: [u8; 32],
+    #[serde(skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub second: Option<[u8; 32]>,
+}
+
+impl PrfInputValue {
+    /// WebAuthn L3 PRF: salt = SHA-256("WebAuthn PRF" || 0x00 || ev.{first,second}).
+    pub fn to_hmac_secret_input(&self) -> HMACGetSecretInput {
+        const PREFIX: &[u8] = b"WebAuthn PRF\x00";
+        let hash = |slice: &[u8]| -> [u8; 32] {
+            let mut hasher = Sha256::default();
+            hasher.update(PREFIX);
+            hasher.update(slice);
+            hasher.finalize().into()
+        };
+        HMACGetSecretInput {
+            salt1: hash(&self.first),
+            salt2: self.second.as_deref().map(hash),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GetAssertionRequest {
+    pub relying_party_id: String,
+    pub challenge: Vec<u8>,
+    pub origin: String,
+    /// The top-level origin if the request was made from a cross-origin
+    /// nested browsing context. None for same-origin requests.
+    pub top_origin: Option<String>,
+    pub allow: Vec<Ctap2PublicKeyCredentialDescriptor>,
+    /// Relying-party hints, in descending order of preference, verbatim as parsed (may contain
+    /// [`PublicKeyCredentialHint::Unknown`]). See [`TransportHintedRequest`](crate::ops::webauthn::TransportHintedRequest).
+    pub hints: Vec<PublicKeyCredentialHint>,
+    pub extensions: Option<GetAssertionRequestExtensions>,
+    pub user_verification: UserVerificationRequirement,
+    pub timeout: Duration,
+}
+
+impl GetAssertionRequest {
+    fn client_data(&self) -> ClientData {
+        ClientData {
+            operation: Operation::GetAssertion,
+            challenge: self.challenge.clone(),
+            origin: self.origin.clone(),
+            top_origin: self.top_origin.clone(),
+        }
+    }
+
+    pub fn client_data_hash(&self) -> Vec<u8> {
+        self.client_data().hash()
+    }
+
+    /// Returns the canonical JSON representation of the client data.
+    pub fn client_data_json(&self) -> String {
+        self.client_data().to_json()
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum GetAssertionPrepareError {
+    /// The client must throw an "EncodingError" DOMException.
+    #[error("Invalid JSON format: {0}")]
+    EncodingError(#[from] JsonError),
+
+    #[error("Unexpected length for {0}: {1}")]
+    UnexpectedLengthError(String, usize),
+
+    #[error("Not supported: {0}")]
+    NotSupported(String),
+
+    #[error("Invalid relying party ID: {0}")]
+    InvalidRelyingPartyId(String),
+
+    #[error("Mismatching relying party ID: {0} != {1}")]
+    MismatchingRelyingPartyId(String, String),
+
+    /// The client must throw a "SecurityError" DOMException.
+    #[error("Invalid AppID: {0}")]
+    InvalidAppId(String),
+}
+
+/// Validates a FIDO AppID string (WebAuthn L3 §10.1.1): a non-empty https URL
+/// whose host is authorised for the caller origin (same-site check). Returns
+/// the AppID unchanged on success.
+async fn validate_appid(
+    request_origin: &RequestOrigin,
+    settings: &RequestSettings<'_>,
+    appid: &str,
+) -> Result<String, GetAssertionPrepareError> {
+    appid_authorised(request_origin, settings, appid)
+        .await
+        .map_err(|err| GetAssertionPrepareError::InvalidAppId(err.to_string()))?;
+    Ok(appid.to_string())
+}
+
+impl GetAssertionRequest {
+    /// Builds a [`GetAssertionRequest`] from its WebAuthn IDL JSON, validating
+    /// the caller origin against rp.id per `settings`.
+    pub async fn prepare(
+        request_origin: &RequestOrigin,
+        json: &str,
+        settings: &RequestSettings<'_>,
+    ) -> Result<Self, GetAssertionPrepareError> {
+        let model: PublicKeyCredentialRequestOptionsJSON = serde_json::from_str(json)?;
+        Self::from_idl_model(request_origin, settings, model).await
+    }
+}
+
+/** dictionary PublicKeyCredentialRequestOptionsJSON {
+    required Base64URLString                                challenge;
+    unsigned long                                           timeout;
+    DOMString                                               rpId;
+    sequence<PublicKeyCredentialDescriptorJSON>             allowCredentials = [];
+    DOMString                                               userVerification = "preferred";
+    sequence<DOMString>                                     hints = [];
+    AuthenticationExtensionsClientInputsJSON                extensions;
+}; */
+#[async_trait]
+impl FromIdlModel<PublicKeyCredentialRequestOptionsJSON> for GetAssertionRequest {
+    type Error = GetAssertionPrepareError;
+
+    async fn from_idl_model(
+        request_origin: &RequestOrigin,
+        settings: &RequestSettings<'_>,
+        inner: PublicKeyCredentialRequestOptionsJSON,
+    ) -> Result<Self, GetAssertionPrepareError> {
+        let effective_rp_id = request_origin.origin.host.as_str();
+        let resolved_rp_id = if let Some(relying_party_id) = inner.relying_party_id.as_deref() {
+            let parsed = RelyingPartyId::try_from(relying_party_id)
+                .map_err(|err| GetAssertionPrepareError::InvalidRelyingPartyId(err.to_string()))?;
+            if !rp_id_authorised(request_origin, &parsed, settings).await {
+                return Err(GetAssertionPrepareError::MismatchingRelyingPartyId(
+                    parsed.0,
+                    effective_rp_id.to_string(),
+                ));
+            }
+            parsed.0
+        } else {
+            RelyingPartyId::try_from(effective_rp_id)
+                .map_err(|err| GetAssertionPrepareError::InvalidRelyingPartyId(err.to_string()))?
+                .0
+        };
+
+        let prf = match inner.extensions.as_ref() {
+            Some(ext) => match &ext.prf {
+                Some(prf_json) => Some(PrfInput::try_from(prf_json.clone())?),
+                None => None,
+            },
+            None => None,
+        };
+
+        let appid = match inner.extensions.as_ref().and_then(|e| e.appid.as_ref()) {
+            Some(s) => Some(validate_appid(request_origin, settings, s).await?),
+            None => None,
+        };
+
+        let large_blob = match inner
+            .extensions
+            .as_ref()
+            .and_then(|e| e.large_blob.as_ref())
+        {
+            // L3 §10.1.5: largeBlob without read=true or support is a no-op, not an error.
+            Some(lb) if lb.support.is_none() && lb.read != Some(true) && lb.write.is_none() => None,
+            Some(lb) => Some(GetAssertionLargeBlobExtension::try_from(lb.clone())?),
+            None => None,
+        };
+
+        let extensions =
+            inner
+                .extensions
+                .as_ref()
+                .map(|extensions_opt| GetAssertionRequestExtensions {
+                    cred_blob: extensions_opt.cred_blob.unwrap_or(false),
+                    large_blob: large_blob.clone(),
+                    prf: prf.clone(),
+                    appid: appid.clone(),
+                });
+
+        let timeout: Duration = inner
+            .timeout
+            .map(|s| Duration::from_millis(s.into()))
+            .unwrap_or(DEFAULT_TIMEOUT);
+
+        Ok(GetAssertionRequest {
+            relying_party_id: resolved_rp_id,
+            challenge: inner.challenge.to_vec(),
+            origin: request_origin.origin.to_string(),
+            top_origin: request_origin.top_origin.as_ref().map(|o| o.to_string()),
+            allow: inner
+                .allow_credentials
+                .into_iter()
+                .map(|c| c.into())
+                .collect(),
+            hints: inner.hints,
+            extensions,
+            user_verification: inner.user_verification,
+            timeout,
+        })
+    }
+}
+
+/// Internal enum for CTAP-level HMAC/PRF handling.
+/// At WebAuthn level, only PRF is exposed. This enum is used internally
+/// to support both PRF (WebAuthn) and raw HMAC (CTAP testing).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GetAssertionHmacOrPrfInput {
+    HmacGetSecret(HMACGetSecretInput),
+    Prf(PrfInput),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrfInput {
+    pub eval: Option<PrfInputValue>,
+    pub eval_by_credential: HashMap<String, PrfInputValue>,
+}
+
+impl TryFrom<PrfInputJson> for PrfInput {
+    type Error = GetAssertionPrepareError;
+
+    fn try_from(value: PrfInputJson) -> Result<Self, Self::Error> {
+        let eval = value.eval.map(|v| PrfInputValue {
+            first: v.first.into(),
+            second: v.second.map(Into::into),
+        });
+        let eval_by_credential = value
+            .eval_by_credential
+            .map(|map| {
+                map.into_iter()
+                    .map(|(k, v)| {
+                        (
+                            k,
+                            PrfInputValue {
+                                first: v.first.into(),
+                                second: v.second.map(Into::into),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(PrfInput {
+            eval,
+            eval_by_credential,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct GetAssertionPrfOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<PrfOutputValue>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HMACGetSecretInput {
+    pub salt1: [u8; 32],
+    pub salt2: Option<[u8; 32]>,
+}
+
+impl TryFrom<HmacGetSecretInputJson> for HMACGetSecretInput {
+    type Error = GetAssertionPrepareError;
+
+    fn try_from(value: HmacGetSecretInputJson) -> Result<Self, Self::Error> {
+        let salt1 = value.salt1.as_slice().try_into().map_err(|_| {
+            GetAssertionPrepareError::UnexpectedLengthError(
+                "extensions.hmacCreateSecret.salt1".to_string(),
+                value.salt1.as_slice().len(),
+            )
+        })?;
+        let salt2 = match value.salt2 {
+            Some(s) => Some(s.as_slice().try_into().map_err(|_| {
+                GetAssertionPrepareError::UnexpectedLengthError(
+                    "extensions.hmacCreateSecret.salt2".to_string(),
+                    s.as_slice().len(),
+                )
+            })?),
+            None => None,
+        };
+        Ok(HMACGetSecretInput { salt1, salt2 })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetAssertionLargeBlobExtension {
+    /// Per WebAuthn L3 §10.1.5 (read=true): fetch the credential's blob.
+    Read,
+    /// Per WebAuthn L3 §10.1.5 (write=ArrayBuffer): store this blob against the credential.
+    Write(Vec<u8>),
+    /// CTAP 2.2 §6.10.6 erase branch. Not exposed via WebAuthn L3 JSON IDL.
+    Delete,
+}
+
+impl TryFrom<LargeBlobInputJson> for GetAssertionLargeBlobExtension {
+    type Error = GetAssertionPrepareError;
+
+    fn try_from(value: LargeBlobInputJson) -> Result<Self, Self::Error> {
+        if value.support.is_some() {
+            return Err(GetAssertionPrepareError::NotSupported(
+                "largeBlob.support is only valid at registration".to_string(),
+            ));
+        }
+        // WebAuthn L3 §10.1.5: read and write present together is an error.
+        if value.read.is_some() && value.write.is_some() {
+            return Err(GetAssertionPrepareError::NotSupported(
+                "largeBlob.read and largeBlob.write are mutually exclusive".to_string(),
+            ));
+        }
+        if let Some(write) = value.write {
+            return Ok(GetAssertionLargeBlobExtension::Write(write.to_vec()));
+        }
+        match value.read {
+            Some(true) => Ok(GetAssertionLargeBlobExtension::Read),
+            _ => Err(GetAssertionPrepareError::NotSupported(
+                "largeBlob input must set read=true or write".to_string(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub struct GetAssertionLargeBlobExtensionOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written: Option<bool>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct GetAssertionRequestExtensions {
+    pub cred_blob: bool,
+    /// PRF extension input. At the CTAP level, this is converted to HMAC secret.
+    pub prf: Option<PrfInput>,
+    pub large_blob: Option<GetAssertionLargeBlobExtension>,
+    /// FIDO AppID extension (WebAuthn L3 §10.1.1). When the relying party has
+    /// existing U2F credentials registered under a legacy AppID, this URL is
+    /// hashed in place of the rpId to derive the U2F application parameter.
+    pub appid: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HMACGetSecretOutput {
+    pub output1: [u8; 32],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output2: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Ctap2HMACGetSecretOutput {
+    // We get this from the device, but have to decrypt it, and
+    // potentially split it into 2 arrays
+    #[serde(with = "serde_bytes")]
+    pub(crate) encrypted_output: Vec<u8>,
+}
+
+impl Ctap2HMACGetSecretOutput {
+    pub(crate) fn decrypt_output(
+        &self,
+        shared_secret: &[u8],
+        uv_proto: &dyn PinUvAuthProtocol,
+    ) -> Option<HMACGetSecretOutput> {
+        let output = match uv_proto.decrypt(shared_secret, &self.encrypted_output) {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(?e, "Failed to decrypt HMAC Secret output with the shared secret, skipping HMAC extension");
+                return None;
+            }
+        };
+        let mut res = HMACGetSecretOutput::default();
+        if output.len() == 32 {
+            res.output1.copy_from_slice(&output);
+        } else if output.len() == 64 {
+            let (o1, o2) = output.split_at(32);
+            res.output1.copy_from_slice(o1);
+            let mut output2 = [0u8; 32];
+            output2.copy_from_slice(o2);
+            res.output2 = Some(output2);
+        } else {
+            warn!(
+                output_len = output.len(),
+                "Failed to split HMAC Secret outputs, skipping HMAC extension"
+            );
+            return None;
+        }
+
+        Some(res)
+    }
+}
+
+pub type GetAssertionResponseExtensions = Ctap2GetAssertionResponseExtensions;
+
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAssertionResponseUnsignedExtensions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hmac_get_secret: Option<HMACGetSecretOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub large_blob: Option<GetAssertionLargeBlobExtensionOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prf: Option<GetAssertionPrfOutput>,
+    /// FIDO AppID extension output (WebAuthn L3 §10.1.1):
+    /// `Some(true)` if the assertion matched the legacy AppID-derived application
+    /// parameter, `Some(false)` if AppID was supplied but `rp.id` was used, `None`
+    /// if the extension wasn't requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub appid: Option<bool>,
+
+    /// Outputs of extensions the authenticator returns unsigned (getAssertion
+    /// response member 0x08), keyed by extension identifier and already
+    /// converted to JSON-safe values. Surfaced verbatim as top-level members of
+    /// the client extension results.
+    #[serde(flatten)]
+    pub unsigned_extension_outputs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Context required for serializing a GetAssertion response to JSON.
+#[derive(Debug, Clone)]
+pub struct GetAssertionResponse {
+    pub assertions: Vec<Assertion>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Assertion {
+    pub credential_id: Option<Ctap2PublicKeyCredentialDescriptor>,
+    pub authenticator_data: AuthenticatorData<GetAssertionResponseExtensions>,
+    pub signature: Vec<u8>,
+    pub user: Option<Ctap2PublicKeyCredentialUserEntity>,
+    pub credentials_count: Option<u32>,
+    pub user_selected: Option<bool>,
+    pub unsigned_extensions_output: Option<GetAssertionResponseUnsignedExtensions>,
+    /// Transport the assertion was produced over, stamped by the channel.
+    pub transport: Option<Transport>,
+}
+
+impl WebAuthnIDLResponse for Assertion {
+    type IdlModel = AuthenticationResponseJSON;
+    type Context = GetAssertionRequest;
+
+    fn to_idl_model(
+        &self,
+        request: &Self::Context,
+    ) -> Result<Self::IdlModel, ResponseSerializationError> {
+        // Get credential ID - either from credential_id field or from authenticator_data
+        let credential_id_bytes = self
+            .credential_id
+            .as_ref()
+            .map(|cred| cred.id.to_vec())
+            .unwrap_or_default();
+
+        let id = base64_url::encode(&credential_id_bytes);
+        let raw_id = Base64UrlString::from(credential_id_bytes);
+
+        // Serialize authenticator data
+        let authenticator_data_bytes = self
+            .authenticator_data
+            .to_response_bytes()
+            .map_err(|e| ResponseSerializationError::AuthenticatorDataError(e.to_string()))?;
+
+        // Get user handle if available
+        let user_handle = self
+            .user
+            .as_ref()
+            .map(|user| Base64UrlString::from(user.id.as_ref()));
+
+        // Build client extension results
+        let client_extension_results = self.build_client_extension_results();
+
+        Ok(AuthenticationResponseJSON {
+            id,
+            raw_id,
+            response: AuthenticatorAssertionResponseJSON {
+                client_data_json: Base64UrlString::from(request.client_data_json().into_bytes()),
+                authenticator_data: Base64UrlString::from(authenticator_data_bytes),
+                signature: Base64UrlString::from(self.signature.clone()),
+                user_handle,
+            },
+            authenticator_attachment: self
+                .transport
+                .map(|t| t.authenticator_attachment().to_string()),
+            client_extension_results,
+            r#type: "public-key".to_string(),
+        })
+    }
+}
+
+impl Assertion {
+    fn build_client_extension_results(&self) -> AuthenticationExtensionsClientOutputsJSON {
+        let mut results = AuthenticationExtensionsClientOutputsJSON::default();
+
+        if let Some(unsigned_ext) = &self.unsigned_extensions_output {
+            // FIDO AppID extension output
+            results.appid = unsigned_ext.appid;
+
+            // HMAC-secret extension output
+            if let Some(hmac_output) = &unsigned_ext.hmac_get_secret {
+                results.hmac_get_secret = Some(HMACGetSecretOutputJSON {
+                    output1: Base64UrlString::from(hmac_output.output1.as_slice()),
+                    output2: hmac_output
+                        .output2
+                        .as_ref()
+                        .map(|o| Base64UrlString::from(o.as_slice())),
+                });
+            }
+
+            // Large blob extension output
+            if let Some(large_blob) = &unsigned_ext.large_blob {
+                results.large_blob = Some(LargeBlobOutputJSON {
+                    supported: None,
+                    blob: large_blob
+                        .blob
+                        .as_ref()
+                        .map(|b| Base64UrlString::from(b.as_slice())),
+                    written: large_blob.written,
+                });
+            }
+
+            // PRF extension output
+            if let Some(prf_output) = &unsigned_ext.prf {
+                results.prf = Some(PRFOutputJSON {
+                    enabled: None,
+                    results: prf_output.results.as_ref().map(|prf_value| PRFValuesJSON {
+                        first: Base64UrlString::from(prf_value.first.as_slice()),
+                        second: prf_value
+                            .second
+                            .as_ref()
+                            .map(|s| Base64UrlString::from(s.as_slice())),
+                    }),
+                });
+            }
+
+            // Unsigned extension outputs (getAssertion 0x08): surface each entry
+            // as a top-level member, skipping ids that collide with a typed
+            // member to avoid emitting a duplicate JSON key.
+            const TYPED_MEMBERS: [&str; 6] = [
+                "appid",
+                "credProps",
+                "hmacCreateSecret",
+                "hmacGetSecret",
+                "largeBlob",
+                "prf",
+            ];
+            for (id, value) in &unsigned_ext.unsigned_extension_outputs {
+                if !TYPED_MEMBERS.contains(&id.as_str()) {
+                    results
+                        .unsigned_extension_outputs
+                        .insert(id.clone(), value.clone());
+                }
+            }
+        }
+
+        results
+    }
+}
+
+impl From<&[Assertion]> for GetAssertionResponse {
+    fn from(assertions: &[Assertion]) -> Self {
+        Self {
+            assertions: assertions.to_owned(),
+        }
+    }
+}
+
+impl From<Assertion> for GetAssertionResponse {
+    fn from(assertion: Assertion) -> Self {
+        Self {
+            assertions: vec![assertion],
+        }
+    }
+}
+
+impl DowngradableRequest<Vec<SignRequest>> for GetAssertionRequest {
+    fn is_downgradable(&self) -> bool {
+        // Options must not include "uv" set to true.
+        if let UserVerificationRequirement::Required = self.user_verification {
+            debug!("Not downgradable: relying party (RP) requires user verification");
+            return false;
+        }
+
+        // allowList must have at least one credential.
+        if self.allow.is_empty() {
+            debug!("Not downgradable: allowList is empty");
+            return false;
+        }
+
+        if matches!(
+            self.extensions.as_ref().and_then(|e| e.large_blob.as_ref()),
+            Some(GetAssertionLargeBlobExtension::Write(_))
+                | Some(GetAssertionLargeBlobExtension::Delete)
+        ) {
+            debug!("Not downgradable: largeBlob write/delete requires FIDO2");
+            return false;
+        }
+
+        true
+    }
+
+    fn try_downgrade(&self) -> Result<Vec<SignRequest>, CtapError> {
+        trace!(?self);
+        let challenge = self.client_data_hash();
+
+        // Let rpIdHash be a byte string of size 32 initialized with SHA-256 hash of rp.id parameter as
+        // CTAP1/U2F application parameter (32 bytes).
+        let mut hasher = Sha256::default();
+        hasher.update(self.relying_party_id.as_bytes());
+        let rp_id_hash = hasher.finalize().to_vec();
+
+        // FIDO AppID extension (WebAuthn L3 §10.1.1): if the relying party
+        // supplies a legacy AppID, additionally derive a second application
+        // parameter from `SHA-256(appid)` and emit a paired SignRequest for
+        // each credential. The downstream U2F sign loop tries both, mirroring
+        // the spec's "try rpId first, then appID" preflight model.
+        let appid_hash: Option<Vec<u8>> = self
+            .extensions
+            .as_ref()
+            .and_then(|e| e.appid.as_ref())
+            .map(|appid| {
+                let mut hasher = Sha256::default();
+                hasher.update(appid.as_bytes());
+                hasher.finalize().to_vec()
+            });
+
+        let mut downgraded_requests: Vec<SignRequest> = Vec::new();
+        for credential in &self.allow {
+            // Let controlByte be a byte initialized as follows:
+            // * If "up" is set to false, set it to 0x08 (dont-enforce-user-presence-and-sign).
+            // * For USB, set it to 0x07 (check-only). This should prevent call getting blocked on waiting for user
+            //   input. If response returns success, then call again setting the enforce-user-presence-and-sign.
+            // * For NFC, set it to 0x03 (enforce-user-presence-and-sign). The tap has already provided the presence
+            //   and won’t block.
+            // --> This is already set to 0x08 in trait: From<&Ctap1RegisterRequest> for ApduRequest
+
+            // Let credentialId is the byte string initialized with the id for this PublicKeyCredentialDescriptor.
+            let credential_id = &credential.id;
+
+            // Let u2fAuthenticateRequest be a byte string with the following structure: [...]
+            downgraded_requests.push(SignRequest::new_upgraded(
+                &rp_id_hash,
+                &challenge,
+                credential_id,
+                self.timeout,
+            ));
+
+            // If an AppID was supplied, also emit a sign request keyed under
+            // the legacy AppID hash, so a U2F-keyed credential under the old
+            // application parameter remains reachable.
+            if let Some(ref appid_hash) = appid_hash {
+                downgraded_requests.push(SignRequest::new_upgraded(
+                    appid_hash,
+                    &challenge,
+                    credential_id,
+                    self.timeout,
+                ));
+            }
+        }
+        trace!(?downgraded_requests);
+        Ok(downgraded_requests)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use serde_bytes::ByteBuf;
+
+    use crate::ops::webauthn::psl::{MockPublicSuffixList, PublicSuffixList};
+    use crate::ops::webauthn::related_origins::{
+        HttpClientError, MaxRegistrableLabels, RelatedOrigins, RelatedOriginsError,
+        RelatedOriginsSource,
+    };
+    use crate::ops::webauthn::{GetAssertionRequest, OriginValidation, RequestOrigin};
+    use crate::proto::ctap2::Ctap2PublicKeyCredentialType;
+
+    use super::*;
+
+    // Fixed-result source; `panicking` proves the suffix-check short-circuit by
+    // failing if consulted.
+    struct MockSource {
+        result: Option<Result<Vec<String>, RelatedOriginsError>>,
+    }
+
+    impl MockSource {
+        fn origins(items: &[&str]) -> Self {
+            Self {
+                result: Some(Ok(items.iter().map(|s| s.to_string()).collect())),
+            }
+        }
+
+        fn err(e: RelatedOriginsError) -> Self {
+            Self {
+                result: Some(Err(e)),
+            }
+        }
+
+        fn panicking() -> Self {
+            Self { result: None }
+        }
+    }
+
+    #[async_trait]
+    impl RelatedOriginsSource for MockSource {
+        async fn allowed_origins(
+            &self,
+            _: &RelyingPartyId,
+        ) -> Result<Vec<String>, RelatedOriginsError> {
+            match &self.result {
+                Some(r) => r.clone(),
+                None => panic!("allowed_origins should not be called"),
+            }
+        }
+    }
+
+    async fn from_json(
+        origin: &RequestOrigin,
+        psl: &dyn PublicSuffixList,
+        related_origins: RelatedOrigins<'_>,
+        json: &str,
+    ) -> Result<GetAssertionRequest, GetAssertionPrepareError> {
+        GetAssertionRequest::prepare(
+            origin,
+            json,
+            &RequestSettings {
+                origin: OriginValidation::Validate {
+                    public_suffix_list: psl,
+                    related_origins,
+                },
+            },
+        )
+        .await
+    }
+
+    pub const REQUEST_BASE_JSON: &str = r#"
+    {
+        "challenge": "Y3JlZGVudGlhbHMtZm9yLWxpbnV4L2xpYndlYmF1dGhu",
+        "timeout": 30000,
+        "rpId": "example.org",
+        "allowCredentials": [
+            {
+                "type": "public-key",
+                "id": "bXktY3JlZGVudGlhbC1pZA"
+            }
+        ],
+        "userVerification": "preferred"
+    }
+    "#;
+
+    fn request_base() -> GetAssertionRequest {
+        GetAssertionRequest {
+            hints: vec![],
+            relying_party_id: "example.org".to_owned(),
+            challenge: base64_url::decode("Y3JlZGVudGlhbHMtZm9yLWxpbnV4L2xpYndlYmF1dGhu").unwrap(),
+            origin: "https://example.org".to_string(),
+            top_origin: None,
+            allow: vec![Ctap2PublicKeyCredentialDescriptor {
+                r#type: Ctap2PublicKeyCredentialType::PublicKey,
+                id: ByteBuf::from(base64_url::decode("bXktY3JlZGVudGlhbC1pZA").unwrap()),
+                transports: None,
+            }],
+            extensions: None, // No extensions key in the base JSON
+            user_verification: UserVerificationRequirement::Preferred,
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    fn json_field_add(str: &str, field: &str, value: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(str).unwrap();
+        v.as_object_mut()
+            .unwrap()
+            .insert(field.to_owned(), serde_json::from_str(value).unwrap());
+        serde_json::to_string(&v).unwrap()
+    }
+
+    fn json_field_rm(str: &str, field: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(str).unwrap();
+        v.as_object_mut().unwrap().remove(field);
+        serde_json::to_string(&v).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_base() {
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req: GetAssertionRequest = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            REQUEST_BASE_JSON,
+        )
+        .await
+        .unwrap();
+        assert_eq!(req, request_base());
+    }
+
+    #[tokio::test]
+    async fn test_request_hints_parsed_and_merged() {
+        use crate::ops::webauthn::{PublicKeyCredentialHint, TransportHintedRequest};
+        use crate::proto::ctap2::Ctap2Transport;
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(
+            &json_field_add(
+                REQUEST_BASE_JSON,
+                "allowCredentials",
+                r#"[{"type":"public-key","id":"bXktY3JlZGVudGlhbC1pZA","transports":["usb"]}]"#,
+            ),
+            "hints",
+            r#"["hybrid","security-key","made-up"]"#,
+        );
+        let req = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        // Hints stored verbatim; the unknown value survives as `Unknown`.
+        assert_eq!(
+            req.hints,
+            vec![
+                PublicKeyCredentialHint::Hybrid,
+                PublicKeyCredentialHint::SecurityKey,
+                PublicKeyCredentialHint::Unknown,
+            ]
+        );
+        // hybrid first, then security-key's roaming set; the allowCredentials `usb` de-dups.
+        assert_eq!(
+            req.preferred_transports(),
+            vec![
+                Ctap2Transport::Hybrid,
+                Ctap2Transport::Usb,
+                Ctap2Transport::Nfc,
+                Ctap2Transport::Ble,
+                Ctap2Transport::SmartCard,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preferred_transports_from_allow_credentials_transports() {
+        use crate::ops::webauthn::TransportHintedRequest;
+        use crate::proto::ctap2::Ctap2Transport;
+        // No hints: preference comes purely from allowCredentials.transports, flattened in
+        // descriptor list order and de-duplicated. A descriptor with no `transports` (a
+        // discoverable credential) contributes nothing.
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(
+            REQUEST_BASE_JSON,
+            "allowCredentials",
+            r#"[
+                {"type":"public-key","id":"bXktY3JlZGVudGlhbC1pZA"},
+                {"type":"public-key","id":"AQID","transports":["usb"]},
+                {"type":"public-key","id":"BAUG","transports":["nfc","usb"]}
+            ]"#,
+        );
+        let req = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        assert!(req.hints.is_empty());
+        assert_eq!(
+            req.preferred_transports(),
+            vec![Ctap2Transport::Usb, Ctap2Transport::Nfc]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preferred_transports_orders_a_device_chooser() {
+        use crate::ops::webauthn::TransportHintedRequest;
+        use crate::proto::ctap2::Ctap2Transport;
+        // The consumer contract in miniature: a partial preference list used as a sort key, with
+        // unlisted transports ranked last while keeping their original relative order.
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "hints", r#"["client-device"]"#);
+        let req = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        let pref = req.preferred_transports();
+        assert_eq!(pref, vec![Ctap2Transport::Internal]);
+
+        let mut devices = vec![
+            Ctap2Transport::Usb,
+            Ctap2Transport::Internal,
+            Ctap2Transport::Hybrid,
+        ];
+        devices.sort_by_key(|t| pref.iter().position(|p| p == t).unwrap_or(usize::MAX));
+        assert_eq!(
+            devices,
+            vec![
+                Ctap2Transport::Internal,
+                Ctap2Transport::Usb,
+                Ctap2Transport::Hybrid,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_passes_through_unknown_transports() {
+        use crate::proto::ctap2::Ctap2Transport;
+
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(
+            REQUEST_BASE_JSON,
+            "allowCredentials",
+            r#"[{"type":"public-key","id":"bXktY3JlZGVudGlhbC1pZA","transports":["usb","smart-card","future-transport"]}]"#,
+        );
+
+        let req: GetAssertionRequest = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+
+        let transports = req.allow[0]
+            .transports
+            .as_ref()
+            .expect("transports preserved");
+        assert_eq!(
+            transports,
+            &vec![
+                Ctap2Transport::Usb,
+                Ctap2Transport::SmartCard,
+                Ctap2Transport::Other("future-transport".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_ignore_missing_rp_id() {
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_rm(REQUEST_BASE_JSON, "rpId");
+
+        let req: GetAssertionRequest = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(req, request_base());
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_invalid_rp_id() {
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "rpId", r#""example.org.""#);
+
+        let result = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GetAssertionPrepareError::InvalidRelyingPartyId(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_rejects_ip_effective_domain() {
+        let request_origin: RequestOrigin = "https://127.0.0.1:8443".parse().unwrap();
+        let req_json = json_field_rm(REQUEST_BASE_JSON, "rpId");
+
+        let result = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GetAssertionPrepareError::InvalidRelyingPartyId(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_rejects_ipv6_effective_domain() {
+        let request_origin: RequestOrigin = "https://[::1]:8443".parse().unwrap();
+        let req_json = json_field_rm(REQUEST_BASE_JSON, "rpId");
+
+        let result = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GetAssertionPrepareError::InvalidRelyingPartyId(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_mismatching_rp_id() {
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "rpId", r#""other.example.org""#);
+
+        let result = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GetAssertionPrepareError::MismatchingRelyingPartyId(_, _))
+        ));
+    }
+
+    #[tokio::test]
+    async fn origin_trust_accepts_mismatching_rp_id() {
+        let request_origin: RequestOrigin = "https://app.example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "rpId", r#""example.com""#);
+        let req = GetAssertionRequest::prepare(
+            &request_origin,
+            &req_json,
+            &RequestSettings {
+                origin: OriginValidation::Trust,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(req.relying_party_id, "example.com");
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_rp_id_is_parent_registrable_suffix() {
+        // origin = login.example.org, rp.id = example.org -> accepted.
+        let request_origin: RequestOrigin = "https://login.example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "rpId", r#""example.org""#);
+
+        let req = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(req.relying_party_id, "example.org");
+        assert_eq!(req.origin, "https://login.example.org");
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_rp_id_is_etld_rejected() {
+        // origin = example.co.uk, rp.id = co.uk (a public suffix) -> rejected.
+        let request_origin: RequestOrigin = "https://example.co.uk".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "rpId", r#""co.uk""#);
+
+        let result = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GetAssertionPrepareError::MismatchingRelyingPartyId(_, _))
+        ));
+    }
+
+    // `.de` substituted with `.org` (MockPublicSuffixList lacks `.de`); pattern
+    // (different eTLD between caller origin and rp.id) is identical.
+
+    #[tokio::test]
+    async fn related_origins_match_resolves_mismatch() {
+        let request_origin: RequestOrigin = "https://app.example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "rpId", r#""example.com""#);
+        let source = MockSource::origins(&["https://app.example.org"]);
+
+        let req = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Enabled {
+                source: &source,
+                max_labels: MaxRegistrableLabels::default(),
+            },
+            &req_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(req.relying_party_id, "example.com");
+    }
+
+    #[tokio::test]
+    async fn related_origins_no_match_keeps_mismatch_error() {
+        let request_origin: RequestOrigin = "https://app.example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "rpId", r#""example.com""#);
+        let source = MockSource::origins(&["https://other.org"]);
+
+        let result = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Enabled {
+                source: &source,
+                max_labels: MaxRegistrableLabels::default(),
+            },
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GetAssertionPrepareError::MismatchingRelyingPartyId(_, _))
+        ));
+    }
+
+    #[tokio::test]
+    async fn related_origins_fetch_error_keeps_mismatch_error() {
+        let request_origin: RequestOrigin = "https://app.example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "rpId", r#""example.com""#);
+        let source = MockSource::err(RelatedOriginsError::Http(HttpClientError::Transport(
+            "simulated".into(),
+        )));
+
+        let result = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Enabled {
+                source: &source,
+                max_labels: MaxRegistrableLabels::default(),
+            },
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(GetAssertionPrepareError::MismatchingRelyingPartyId(_, _))
+        ));
+    }
+
+    #[tokio::test]
+    async fn related_origins_not_consulted_when_suffix_matches() {
+        let request_origin: RequestOrigin = "https://login.example.com".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "rpId", r#""example.com""#);
+        let source = MockSource::panicking();
+
+        let req = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Enabled {
+                source: &source,
+                max_labels: MaxRegistrableLabels::default(),
+            },
+            &req_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(req.relying_party_id, "example.com");
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_ignore_missing_allow_credentials() {
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_rm(REQUEST_BASE_JSON, "allowCredentials");
+
+        let req: GetAssertionRequest = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            req,
+            GetAssertionRequest {
+                allow: vec![],
+                ..request_base()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_default_timeout() {
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_rm(REQUEST_BASE_JSON, "timeout");
+
+        let req: GetAssertionRequest = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(req.timeout, DEFAULT_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_empty_extensions() {
+        // Test that "extensions": {} results in Some(default) not None
+        // This is important for strict portals that distinguish between
+        // no extensions key vs empty extensions object
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "extensions", r#"{}"#);
+
+        let req: GetAssertionRequest = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            req.extensions,
+            Some(GetAssertionRequestExtensions::default())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_appid_extension() {
+        // Same-site AppID (equal host) is authorised for the caller.
+        let request_origin: RequestOrigin = "https://www.example.org".parse().unwrap();
+        let req_json = json_field_add(
+            REQUEST_BASE_JSON,
+            "extensions",
+            r#"{"appid":"https://www.example.org/u2f/origins.json"}"#,
+        );
+
+        let req: GetAssertionRequest = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        let ext = req.extensions.expect("extensions should be present");
+        assert_eq!(
+            ext.appid.as_deref(),
+            Some("https://www.example.org/u2f/origins.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_appid_extension_invalid_non_https() {
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(
+            REQUEST_BASE_JSON,
+            "extensions",
+            r#"{"appid":"http://www.example.org/u2f/origins.json"}"#,
+        );
+
+        let res = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            res,
+            Err(GetAssertionPrepareError::InvalidAppId(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_appid_extension_rejects_cross_site() {
+        // WebAuthn L3 §10.1.1: a cross-site AppID is not authorised.
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(
+            REQUEST_BASE_JSON,
+            "extensions",
+            r#"{"appid":"https://example.net/u2f/origins.json"}"#,
+        );
+
+        let res = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            res,
+            Err(GetAssertionPrepareError::InvalidAppId(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_appid_extension_parent_domain() {
+        // Legacy U2F migration: a subdomain caller may use its registrable
+        // parent domain as the AppID (WebAuthn L3 §10.1.1).
+        let request_origin: RequestOrigin = "https://login.example.org".parse().unwrap();
+        let req_json = json_field_add(
+            REQUEST_BASE_JSON,
+            "extensions",
+            r#"{"appid":"https://example.org/u2f/origins.json"}"#,
+        );
+
+        let req: GetAssertionRequest = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .unwrap();
+        let ext = req.extensions.expect("extensions should be present");
+        assert_eq!(
+            ext.appid.as_deref(),
+            Some("https://example.org/u2f/origins.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_appid_extension_rejects_subdomain() {
+        // The AppID host must be a suffix of the caller host, so a parent-domain
+        // caller cannot claim a more-specific subdomain AppID.
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(
+            REQUEST_BASE_JSON,
+            "extensions",
+            r#"{"appid":"https://sub.example.org/u2f/origins.json"}"#,
+        );
+
+        let res = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await;
+        assert!(matches!(
+            res,
+            Err(GetAssertionPrepareError::InvalidAppId(_))
+        ));
+    }
+
+    #[test]
+    fn test_try_downgrade_with_appid_uses_appid_hash() {
+        use sha2::{Digest, Sha256};
+
+        let mut req = request_base();
+        req.extensions = Some(GetAssertionRequestExtensions {
+            cred_blob: false,
+            prf: None,
+            large_blob: None,
+            appid: Some("https://www.example.org/u2f/origins.json".to_string()),
+        });
+
+        let sign_requests = req.try_downgrade().expect("downgrade ok");
+        // With one credential in allow and `appid` set, we emit two requests:
+        // first the rp.id-derived one, then the appid-derived one.
+        assert_eq!(sign_requests.len(), 2);
+
+        let mut rp_hasher = Sha256::default();
+        rp_hasher.update(b"example.org");
+        let rp_hash = rp_hasher.finalize().to_vec();
+
+        let mut appid_hasher = Sha256::default();
+        appid_hasher.update(b"https://www.example.org/u2f/origins.json");
+        let appid_hash = appid_hasher.finalize().to_vec();
+
+        assert_eq!(sign_requests[0].app_id_hash, rp_hash);
+        assert_eq!(sign_requests[1].app_id_hash, appid_hash);
+        assert_eq!(sign_requests[0].key_handle, sign_requests[1].key_handle);
+    }
+
+    #[test]
+    fn test_try_downgrade_without_appid_uses_rp_hash() {
+        use sha2::{Digest, Sha256};
+
+        let req = request_base();
+        let sign_requests = req.try_downgrade().expect("downgrade ok");
+        // One credential, no appid: one request.
+        assert_eq!(sign_requests.len(), 1);
+
+        let mut rp_hasher = Sha256::default();
+        rp_hasher.update(b"example.org");
+        let rp_hash = rp_hasher.finalize().to_vec();
+        assert_eq!(sign_requests[0].app_id_hash, rp_hash);
+    }
+
+    async fn parse_prf(extensions_json: &str) -> PrfInput {
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let req_json = json_field_add(REQUEST_BASE_JSON, "extensions", extensions_json);
+        let req = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &req_json,
+        )
+        .await
+        .expect("request should parse");
+        req.extensions
+            .expect("extensions")
+            .prf
+            .expect("prf extension")
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_prf_extension() {
+        // Non-32-byte inputs must now parse (W3C WebAuthn L3 §10.1.4). "AQID"
+        // decodes to 0x010203, "BAUG" to 0x040506.
+        let prf = parse_prf(r#"{"prf":{"eval":{"first":"AQID","second":"BAUG"}}}"#).await;
+        let eval = prf.eval.expect("eval");
+        assert_eq!(eval.first, vec![0x01, 0x02, 0x03]);
+        assert_eq!(eval.second.as_deref(), Some(&[0x04u8, 0x05, 0x06][..]));
+    }
+
+    #[tokio::test]
+    async fn test_prf_input_variable_length() {
+        // W3C WebAuthn L3 §10.1.4: PRF inputs are BufferSources of any length.
+        for len in [1usize, 16, 31, 33, 64, 256] {
+            let bytes = vec![0xABu8; len];
+            let b64 = base64_url::encode(&bytes);
+            let prf = parse_prf(&format!(r#"{{"prf":{{"eval":{{"first":"{b64}"}}}}}}"#)).await;
+            let eval = prf.eval.unwrap();
+            assert_eq!(eval.first.len(), len, "len {len}");
+            assert_eq!(eval.first, bytes, "len {len}");
+            assert!(eval.second.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prf_input_short_via_json() {
+        // Regression test for #209: a sub-32-byte salt encoded in the JSON IDL
+        // must round-trip through GetAssertionRequest::from_json into a
+        // PrfInputValue with the expected bytes.
+        let prf = parse_prf(r#"{"prf":{"eval":{"first":"aGk"}}}"#).await; // base64url "aGk" -> b"hi"
+        let eval = prf.eval.expect("eval");
+        assert_eq!(eval.first, b"hi");
+        assert!(eval.second.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prf_input_empty_allowed() {
+        // §10.1.4 says "of any length" with no lower bound; empty must parse.
+        let prf = parse_prf(r#"{"prf":{"eval":{"first":""}}}"#).await;
+        let eval = prf.eval.unwrap();
+        assert!(eval.first.is_empty());
+        assert!(eval.second.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prf_eval_by_credential_variable_length() {
+        let prf =
+            parse_prf(r#"{"prf":{"evalByCredential":{"Y3JlZDE":{"first":"AQ","second":"AgIC"}}}}"#)
+                .await;
+        let v = prf.eval_by_credential.get("Y3JlZDE").expect("entry");
+        assert_eq!(v.first, vec![0x01]);
+        assert_eq!(v.second.as_deref(), Some(&[0x02u8, 0x02, 0x02][..]));
+    }
+
+    // Tests for response JSON serialization
+
+    fn create_test_assertion() -> Assertion {
+        use crate::fido::{AuthenticatorData, AuthenticatorDataFlags};
+
+        let authenticator_data = AuthenticatorData {
+            rp_id_hash: [0u8; 32],
+            flags: AuthenticatorDataFlags::USER_PRESENT,
+            signature_count: 1,
+            attested_credential: None,
+            extensions: None,
+            raw: None,
+        };
+
+        Assertion {
+            credential_id: Some(Ctap2PublicKeyCredentialDescriptor {
+                r#type: Ctap2PublicKeyCredentialType::PublicKey,
+                id: ByteBuf::from(vec![0x01, 0x02, 0x03, 0x04]),
+                transports: None,
+            }),
+            authenticator_data,
+            signature: vec![0xDE, 0xAD, 0xC0, 0xDE],
+            user: None,
+            credentials_count: None,
+            user_selected: None,
+            unsigned_extensions_output: None,
+            transport: None,
+        }
+    }
+
+    fn create_test_request() -> GetAssertionRequest {
+        GetAssertionRequest {
+            hints: vec![],
+            relying_party_id: "example.org".to_owned(),
+            challenge: b"DEADCODE_challenge".to_vec(),
+            origin: "example.org".to_string(),
+            top_origin: None,
+            allow: vec![],
+            extensions: None,
+            user_verification: UserVerificationRequirement::Preferred,
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn test_assertion_to_json() {
+        use crate::ops::webauthn::idl::response::JsonFormat;
+
+        let assertion = create_test_assertion();
+        let request = create_test_request();
+        let json = assertion.to_json_string(&request, JsonFormat::default());
+        assert!(json.is_ok());
+
+        let json_str = json.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        // Verify credential ID fields match test data
+        let expected_credential_id = base64_url::encode(&[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(parsed.get("id").unwrap(), &expected_credential_id);
+        assert_eq!(parsed.get("rawId").unwrap(), &expected_credential_id);
+        assert_eq!(parsed.get("type").unwrap(), "public-key");
+
+        // Verify response object
+        let response_obj = parsed.get("response").unwrap();
+        assert!(response_obj.get("clientDataJSON").is_some());
+        assert!(response_obj.get("authenticatorData").is_some());
+
+        // Verify signature matches test data
+        let expected_signature = base64_url::encode(&[0xDE, 0xAD, 0xC0, 0xDE]);
+        assert_eq!(response_obj.get("signature").unwrap(), &expected_signature);
+    }
+
+    #[test]
+    fn test_assertion_to_idl_model() {
+        let assertion = create_test_assertion();
+        let request = create_test_request();
+        let model = assertion.to_idl_model(&request).unwrap();
+
+        // Verify the credential ID
+        assert_eq!(model.raw_id.0, vec![0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(model.r#type, "public-key");
+
+        // Verify signature
+        assert_eq!(model.response.signature.0, vec![0xDE, 0xAD, 0xC0, 0xDE]);
+    }
+
+    #[test]
+    fn test_assertion_to_idl_model_populates_attachment() {
+        // libwebauthn drives roaming authenticators, so every known transport
+        // yields authenticatorAttachment "cross-platform" (WebAuthn L3 §5.1).
+        let mut assertion = create_test_assertion();
+        let request = create_test_request();
+
+        for transport in [
+            Transport::Usb,
+            Transport::Ble,
+            Transport::Nfc,
+            Transport::Hybrid,
+        ] {
+            assertion.transport = Some(transport);
+            let model = assertion.to_idl_model(&request).unwrap();
+            assert_eq!(
+                model.authenticator_attachment.as_deref(),
+                Some("cross-platform")
+            );
+        }
+
+        // An unknown transport omits the field.
+        assertion.transport = None;
+        let model = assertion.to_idl_model(&request).unwrap();
+        assert_eq!(model.authenticator_attachment, None);
+    }
+
+    #[test]
+    fn test_assertion_with_user_handle() {
+        use crate::proto::ctap2::Ctap2PublicKeyCredentialUserEntity;
+
+        let mut assertion = create_test_assertion();
+        assertion.user = Some(Ctap2PublicKeyCredentialUserEntity::new(
+            b"test-user-id",
+            "testuser",
+            "Test User",
+        ));
+
+        let request = create_test_request();
+        let model = assertion.to_idl_model(&request).unwrap();
+
+        // Verify user handle is present
+        assert!(model.response.user_handle.is_some());
+        assert_eq!(
+            model.response.user_handle.as_ref().unwrap().0,
+            b"test-user-id".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_assertion_with_extensions() {
+        let mut assertion = create_test_assertion();
+        assertion.unsigned_extensions_output = Some(GetAssertionResponseUnsignedExtensions {
+            hmac_get_secret: None,
+            large_blob: None,
+            prf: Some(GetAssertionPrfOutput {
+                results: Some(PrfOutputValue {
+                    first: [0x01u8; 32],
+                    second: None,
+                }),
+            }),
+            appid: None,
+            unsigned_extension_outputs: Default::default(),
+        });
+
+        let request = create_test_request();
+        let model = assertion.to_idl_model(&request).unwrap();
+
+        // Verify extension outputs - PRF should be set with correct values
+        let prf = model.client_extension_results.prf.as_ref().unwrap();
+        assert!(prf.enabled.is_none()); // enabled is only set on registration
+        let results = prf.results.as_ref().unwrap();
+        assert_eq!(results.first.0, vec![0x01u8; 32]);
+        assert!(results.second.is_none());
+    }
+
+    #[test]
+    fn test_assertion_appid_extension_output_true() {
+        let mut assertion = create_test_assertion();
+        assertion.unsigned_extensions_output = Some(GetAssertionResponseUnsignedExtensions {
+            hmac_get_secret: None,
+            large_blob: None,
+            prf: None,
+            appid: Some(true),
+            unsigned_extension_outputs: Default::default(),
+        });
+
+        let request = create_test_request();
+        let model = assertion.to_idl_model(&request).unwrap();
+        assert_eq!(model.client_extension_results.appid, Some(true));
+
+        // The output should also round-trip through the JSON wire format.
+        let json = serde_json::to_value(&model.client_extension_results).unwrap();
+        assert_eq!(
+            json.get("appid").and_then(|v| v.as_bool()),
+            Some(true),
+            "JSON output should include `appid: true`"
+        );
+    }
+
+    #[test]
+    fn test_assertion_appid_extension_output_omitted_when_none() {
+        let mut assertion = create_test_assertion();
+        assertion.unsigned_extensions_output = Some(GetAssertionResponseUnsignedExtensions {
+            hmac_get_secret: None,
+            large_blob: None,
+            prf: None,
+            appid: None,
+            unsigned_extension_outputs: Default::default(),
+        });
+
+        let request = create_test_request();
+        let model = assertion.to_idl_model(&request).unwrap();
+        assert_eq!(model.client_extension_results.appid, None);
+
+        let json = serde_json::to_value(&model.client_extension_results).unwrap();
+        assert!(
+            json.get("appid").is_none(),
+            "JSON output should omit `appid` when not requested"
+        );
+    }
+
+    #[test]
+    fn large_blob_json_read_input_and_identifier() {
+        use crate::ops::webauthn::idl::get::{
+            GetAssertionRequestExtensionsJSON, LargeBlobInputJson,
+        };
+
+        assert_eq!(
+            GetAssertionLargeBlobExtension::try_from(LargeBlobInputJson {
+                support: None,
+                read: Some(true),
+                write: None,
+            })
+            .unwrap(),
+            GetAssertionLargeBlobExtension::Read
+        );
+        assert!(matches!(
+            GetAssertionLargeBlobExtension::try_from(LargeBlobInputJson {
+                support: Some("required".to_string()),
+                read: Some(true),
+                write: None,
+            }),
+            Err(GetAssertionPrepareError::NotSupported(_))
+        ));
+
+        let ext: GetAssertionRequestExtensionsJSON =
+            serde_json::from_str(r#"{"largeBlob":{"read":true}}"#).unwrap();
+        assert!(
+            ext.large_blob.is_some(),
+            "extension keyed under `largeBlob`"
+        );
+        let ext: GetAssertionRequestExtensionsJSON =
+            serde_json::from_str(r#"{"largeBlobKey":{"read":true}}"#).unwrap();
+        assert!(
+            ext.large_blob.is_none(),
+            "legacy `largeBlobKey` must not bind"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_from_json_large_blob_read_false_is_noop() {
+        let request_origin: RequestOrigin = "https://example.org".parse().unwrap();
+        let json = json_field_add(
+            REQUEST_BASE_JSON,
+            "extensions",
+            r#"{"largeBlob":{"read":false}}"#,
+        );
+        let req = from_json(
+            &request_origin,
+            &MockPublicSuffixList,
+            RelatedOrigins::Disabled,
+            &json,
+        )
+        .await
+        .expect("largeBlob.read=false must be a no-op, not an error");
+        assert!(req.extensions.and_then(|e| e.large_blob).is_none());
+    }
+
+    #[test]
+    fn large_blob_json_write_input_and_mutual_exclusion() {
+        use crate::ops::webauthn::idl::get::LargeBlobInputJson;
+
+        let blob = b"blob to write".to_vec();
+        assert_eq!(
+            GetAssertionLargeBlobExtension::try_from(LargeBlobInputJson {
+                support: None,
+                read: None,
+                write: Some(Base64UrlString::from(blob.clone())),
+            })
+            .unwrap(),
+            GetAssertionLargeBlobExtension::Write(blob)
+        );
+        assert!(matches!(
+            GetAssertionLargeBlobExtension::try_from(LargeBlobInputJson {
+                support: None,
+                read: Some(true),
+                write: Some(Base64UrlString::from(b"x".to_vec())),
+            }),
+            Err(GetAssertionPrepareError::NotSupported(_))
+        ));
+    }
+}

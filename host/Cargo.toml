@@ -23,3 +23,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 strip = true
+
+# Vendored copy of libwebauthn with the native `largeBlob` extension (phones/hybrid);
+# see vendor/libwebauthn/UPSTREAM_COMMIT and VENDOR.md.
+[patch.crates-io]
+libwebauthn = { path = "vendor/libwebauthn" }

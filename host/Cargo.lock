@@ -1445,8 +1445,6 @@ dependencies = [
 [[package]]
 name = "libwebauthn"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bcae5a7cd420e87f4f1e53eab05651135d403d94beb58905a32aac385cdc7c0"
 dependencies = [
  "aes",
  "aes-gcm",

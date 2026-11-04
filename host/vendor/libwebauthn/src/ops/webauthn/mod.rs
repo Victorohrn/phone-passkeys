@@ -1,0 +1,233 @@
+mod client_data;
+mod get_assertion;
+mod hints;
+pub mod idl;
+mod large_blob;
+mod make_credential;
+pub mod psl;
+pub mod related_origins;
+mod timeout;
+
+use super::u2f::{RegisterRequest, SignRequest};
+use crate::webauthn::CtapError;
+pub use client_data::ClientData;
+pub use get_assertion::{
+    Assertion, Ctap2HMACGetSecretOutput, GetAssertionHmacOrPrfInput,
+    GetAssertionLargeBlobExtension, GetAssertionLargeBlobExtensionOutput, GetAssertionPrepareError,
+    GetAssertionPrfOutput, GetAssertionRequest, GetAssertionRequestExtensions,
+    GetAssertionResponse, GetAssertionResponseExtensions, GetAssertionResponseUnsignedExtensions,
+    HMACGetSecretInput, HMACGetSecretOutput, PrfInput, PrfInputValue, PrfOutputValue,
+};
+pub use hints::{AuthenticatorAttachment, PublicKeyCredentialHint, TransportHintedRequest};
+pub use idl::{
+    origin::{HostParseError, Origin, OriginHost, OriginParseError, RequestOrigin, Scheme},
+    rpid::RelyingPartyId,
+    AuthenticationExtensionsClientOutputsJSON, AuthenticationResponseJSON,
+    AuthenticatorAssertionResponseJSON, AuthenticatorAttestationResponseJSON, Base64UrlString,
+    JsonFormat, OriginValidation, RegistrationResponseJSON, RequestSettings,
+    ResponseSerializationError, WebAuthnIDLResponse,
+};
+pub(crate) use large_blob::{
+    decrypt_first_matching, deflate_large_blob, delete_authenticator_large_blob,
+    fetch_large_blob_entries, inflate_large_blob, max_fragment_length,
+    write_authenticator_large_blob,
+};
+pub use make_credential::{
+    CredentialPropsExtension, CredentialProtectionExtension, CredentialProtectionPolicy,
+    MakeCredentialLargeBlobExtension, MakeCredentialLargeBlobExtensionInput,
+    MakeCredentialLargeBlobExtensionOutput, MakeCredentialPrepareError, MakeCredentialPrfInput,
+    MakeCredentialPrfOutput, MakeCredentialRequest, MakeCredentialResponse,
+    MakeCredentialsRequestExtensions, MakeCredentialsResponseExtensions,
+    MakeCredentialsResponseUnsignedExtensions, ResidentKeyRequirement,
+};
+pub use psl::{
+    DafsaFileLoadError, DafsaFilePublicSuffixList, DatFileLoadError, DatFilePublicSuffixList,
+    PublicSuffixList, SystemLoadError, SystemPublicSuffixList, SYSTEM_PSL_DAFSA_PATH,
+    SYSTEM_PSL_PATH,
+};
+pub use related_origins::{
+    validate_related_origins, HttpClient, HttpClientError, MaxRegistrableLabels, RelatedOrigins,
+    RelatedOriginsError, RelatedOriginsSource, StaticRelatedOriginsSource,
+    WellKnownRelatedOriginsSource,
+};
+#[cfg(feature = "reqwest-related-origins-source")]
+pub use related_origins::{HttpPolicy, ReqwestHttpClient, ReqwestRelatedOriginsSource};
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+pub enum Operation {
+    MakeCredential,
+    GetAssertion,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum UserVerificationRequirement {
+    Required,
+    Discouraged,
+    #[default]
+    #[serde(other)]
+    Preferred,
+}
+
+impl UserVerificationRequirement {
+    /// Check if user verification is discouraged
+    pub fn is_discouraged(&self) -> bool {
+        match self {
+            Self::Required | Self::Preferred => false,
+            Self::Discouraged => true,
+        }
+    }
+
+    /// Check if user verification is preferred or required for this request
+    pub fn is_preferred(&self) -> bool {
+        match self {
+            Self::Required | Self::Preferred => true,
+            Self::Discouraged => false,
+        }
+    }
+
+    /// Check if user verification is strictly required for this request
+    pub fn is_required(&self) -> bool {
+        match self {
+            Self::Required => true,
+            Self::Preferred | Self::Discouraged => false,
+        }
+    }
+}
+
+pub trait DowngradableRequest<T> {
+    fn is_downgradable(&self) -> bool;
+    fn try_downgrade(&self) -> Result<T, CtapError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ops::webauthn::make_credential::{
+        CredentialProtectionExtension, CredentialProtectionPolicy,
+        MakeCredentialLargeBlobExtension, MakeCredentialLargeBlobExtensionInput,
+        MakeCredentialsRequestExtensions, ResidentKeyRequirement,
+    };
+    use crate::ops::webauthn::{
+        DowngradableRequest, MakeCredentialRequest, UserVerificationRequirement,
+    };
+    use crate::proto::ctap2::{
+        Ctap2COSEAlgorithmIdentifier, Ctap2CredentialType, Ctap2PublicKeyCredentialType,
+    };
+
+    #[test]
+    fn ctap2_make_credential_downgradable() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::default()];
+        request.resident_key = Some(ResidentKeyRequirement::Discouraged);
+        assert!(request.is_downgradable());
+    }
+
+    #[test]
+    fn ctap2_make_credential_downgradable_unsupported_rk() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::default()];
+        request.resident_key = Some(ResidentKeyRequirement::Required);
+        assert!(!request.is_downgradable());
+    }
+
+    #[test]
+    fn ctap2_make_credential_downgradable_unsupported_uv() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::default()];
+        request.user_verification = UserVerificationRequirement::Required;
+        assert!(!request.is_downgradable());
+    }
+
+    #[test]
+    fn ctap2_make_credential_downgradable_unsupported_algorithm() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::new(
+            Ctap2PublicKeyCredentialType::PublicKey,
+            Ctap2COSEAlgorithmIdentifier::EDDSA,
+        )];
+        assert!(!request.is_downgradable());
+    }
+
+    #[test]
+    fn ctap2_make_credential_downgradable_enforced_cred_protect_required() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::default()];
+        request.extensions = Some(MakeCredentialsRequestExtensions {
+            cred_protect: Some(CredentialProtectionExtension {
+                policy: CredentialProtectionPolicy::UserVerificationRequired,
+                enforce_policy: true,
+            }),
+            ..MakeCredentialsRequestExtensions::default()
+        });
+        assert!(!request.is_downgradable());
+    }
+
+    #[test]
+    fn ctap2_make_credential_downgradable_enforced_cred_protect_optional_with_list() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::default()];
+        request.extensions = Some(MakeCredentialsRequestExtensions {
+            cred_protect: Some(CredentialProtectionExtension {
+                policy: CredentialProtectionPolicy::UserVerificationOptionalWithCredentialIDList,
+                enforce_policy: true,
+            }),
+            ..MakeCredentialsRequestExtensions::default()
+        });
+        assert!(!request.is_downgradable());
+    }
+
+    #[test]
+    fn ctap2_make_credential_downgradable_enforced_cred_protect_optional() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::default()];
+        request.extensions = Some(MakeCredentialsRequestExtensions {
+            cred_protect: Some(CredentialProtectionExtension {
+                policy: CredentialProtectionPolicy::UserVerificationOptional,
+                enforce_policy: true,
+            }),
+            ..MakeCredentialsRequestExtensions::default()
+        });
+        assert!(request.is_downgradable());
+    }
+
+    #[test]
+    fn ctap2_make_credential_downgradable_non_enforced_cred_protect() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::default()];
+        request.extensions = Some(MakeCredentialsRequestExtensions {
+            cred_protect: Some(CredentialProtectionExtension {
+                policy: CredentialProtectionPolicy::UserVerificationRequired,
+                enforce_policy: false,
+            }),
+            ..MakeCredentialsRequestExtensions::default()
+        });
+        assert!(request.is_downgradable());
+    }
+
+    #[test]
+    fn ctap2_make_credential_downgradable_large_blob_required() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::default()];
+        request.extensions = Some(MakeCredentialsRequestExtensions {
+            large_blob: Some(MakeCredentialLargeBlobExtensionInput {
+                support: MakeCredentialLargeBlobExtension::Required,
+            }),
+            ..MakeCredentialsRequestExtensions::default()
+        });
+        assert!(!request.is_downgradable());
+    }
+
+    #[test]
+    fn ctap2_make_credential_downgradable_large_blob_preferred() {
+        let mut request = MakeCredentialRequest::dummy();
+        request.algorithms = vec![Ctap2CredentialType::default()];
+        request.extensions = Some(MakeCredentialsRequestExtensions {
+            large_blob: Some(MakeCredentialLargeBlobExtensionInput {
+                support: MakeCredentialLargeBlobExtension::Preferred,
+            }),
+            ..MakeCredentialsRequestExtensions::default()
+        });
+        assert!(request.is_downgradable());
+    }
+}
