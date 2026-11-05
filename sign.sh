@@ -8,7 +8,11 @@
 # from WEB_EXT_API_KEY / WEB_EXT_API_SECRET, or from ~/.config/phone-passkeys/amo.env:
 #   WEB_EXT_API_KEY=user:12345:678
 #   WEB_EXT_API_SECRET=...
-# Keep that file chmod 600 and never commit it.
+# Keep that file chmod 600 and never commit it. Either value may also be a 1Password
+# secret reference, resolved at run time with the 1Password CLI so nothing secret is
+# stored on disk:
+#   WEB_EXT_API_KEY="op://Private/Mozilla Dev API/username"
+#   WEB_EXT_API_SECRET="op://Private/Mozilla Dev API/credential"
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +26,17 @@ ENV_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/phone-passkeys/amo.env"
 if [ -f "$ENV_FILE" ]; then
   set -a; . "$ENV_FILE"; set +a
 fi
+resolve_secret() {
+  case "$1" in
+    op://*)
+      command -v op >/dev/null 2>&1 || { echo "1Password CLI (op) is needed to resolve $1" >&2; exit 1; }
+      op read --no-newline "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+WEB_EXT_API_KEY="$(resolve_secret "${WEB_EXT_API_KEY:-}")"
+WEB_EXT_API_SECRET="$(resolve_secret "${WEB_EXT_API_SECRET:-}")"
+export WEB_EXT_API_KEY WEB_EXT_API_SECRET
 : "${WEB_EXT_API_KEY:?set WEB_EXT_API_KEY (JWT issuer from the AMO API keys page)}"
 : "${WEB_EXT_API_SECRET:?set WEB_EXT_API_SECRET (JWT secret from the AMO API keys page)}"
 

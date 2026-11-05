@@ -158,7 +158,8 @@ Everything an AMO submission needs is in the repo:
   Developer Hub.
 - `sign.sh`: wraps `web-ext sign`. Credentials come from the AMO API keys page
   and are read from `WEB_EXT_API_KEY` / `WEB_EXT_API_SECRET` or
-  `~/.config/phone-passkeys/amo.env`.
+  `~/.config/phone-passkeys/amo.env`. Both may be 1Password secret references
+  (`op://vault/item/field`), resolved with the `op` CLI when the script runs.
 
 ```sh
 ./sign.sh unlisted   # self-distributed: signed .xpi in dist/, nothing published
